@@ -320,19 +320,30 @@ function codexEnv() {
   return Object.fromEntries(allowed.filter((name) => process.env[name]).map((name) => [name, process.env[name]]));
 }
 
-export async function loginStatus() {
+export async function loginStatus({ signal } = {}) {
   return new Promise((resolve) => {
+    const unavailable = { available: false, reason: '请先在终端运行 codex login，用 ChatGPT 账号登录。' };
+    if (signal?.aborted) { resolve(unavailable); return; }
     const child = spawn(process.env.COMPANION_CODEX_BIN || 'codex', ['login', 'status'], { env: codexEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
-    let result = '';
-    const timer = setTimeout(() => child.kill('SIGTERM'), 5000);
-    child.stdout.on('data', (data) => { result += data.toString().slice(0, 2048); });
-    child.stderr.on('data', (data) => { result += data.toString().slice(0, 2048); });
-    child.on('error', () => { clearTimeout(timer); resolve({ available: false, reason: '没有找到 Codex CLI，请先安装并运行 codex login。' }); });
+    let result = '', hardKill;
+    const stop = () => {
+      if (hardKill) return;
+      hardKill = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 1500);
+      hardKill.unref();child.kill('SIGTERM');
+    };
+    const timer = setTimeout(stop, 5000);
+    const finish = value => {
+      clearTimeout(timer);clearTimeout(hardKill);signal?.removeEventListener('abort', stop);resolve(value);
+    };
+    signal?.addEventListener('abort', stop, { once: true });
+    const append = chunk => { result = (result + chunk).slice(-4096); };
+    child.stdout.setEncoding('utf8').on('data', append);
+    child.stderr.setEncoding('utf8').on('data', append);
+    child.on('error', () => finish({ available: false, reason: '没有找到 Codex CLI，请先安装并运行 codex login。' }));
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 && /ChatGPT/i.test(result)
+      finish(!hardKill && code === 0 && /ChatGPT/i.test(result)
         ? { available: true, reason: '使用本机 Codex 的 ChatGPT 订阅登录。' }
-        : { available: false, reason: '请先在终端运行 codex login，用 ChatGPT 账号登录。' });
+        : unavailable);
     });
   });
 }

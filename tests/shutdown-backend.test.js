@@ -44,3 +44,31 @@ test('shutdown aborts active and reserved requests, waits for the runner and rej
   assert.equal(done, true);
   assert.deepEqual(modes, ['autonomy']);
 });
+
+test('shutdown cancels a pending login check and waits for its cleanup', { timeout: 5000 }, async t => {
+  const started = deferred(), release = deferred();
+  let signal;
+  const app = createApp({ getStatus: async options => {
+    signal = options?.signal;
+    started.resolve();
+    await release.promise;
+    return { available: false };
+  } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { release.resolve();server.closeAllConnections();return new Promise(resolve => server.close(resolve)); });
+  const status = fetch(`http://127.0.0.1:${server.address().port}/api/status`);
+  void status.catch(() => {});
+  await started.promise;
+  let done = false;
+  const stopping = app.locals.stopCompanion().then(() => { done = true; });
+  assert.equal(signal?.aborted, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(done, false);
+  release.resolve();
+  const response = await status;
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, 'SHUTTING_DOWN');
+  await stopping;
+  assert.equal(done, true);
+});

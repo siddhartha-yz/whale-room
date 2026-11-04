@@ -12,13 +12,15 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
   app.disable('x-powered-by');
   let activeRun = null;
   let chatReservation = null;
+  const statusRuns = new Set();
   let shuttingDown = false, shutdownWork;
   app.locals.stopCompanion = () => {
     if (shuttingDown) return shutdownWork;
     shuttingDown = true;
-    shutdownWork = activeRun?.finished ?? Promise.resolve();
+    shutdownWork = Promise.all([activeRun?.finished, ...Array.from(statusRuns, run => run.finished)]);
     chatReservation?.abort();
     activeRun?.controller.abort();
+    for (const run of statusRuns) run.controller.abort();
     return shutdownWork;
   };
   const autonomyStarts = [];
@@ -43,8 +45,19 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
   // Twenty 4,000-character Chinese history entries alone need about 240 KB.
   app.use(express.json({ limit: '512kb', strict: true }));
   app.get('/api/status', async (_req, res) => {
-    const result = await getStatus();
-    res.json({ ...result, busy: Boolean(activeRun || chatReservation), model: MODEL, provider: PROVIDER });
+    const controller = new AbortController();
+    const cancel = () => { if (!res.writableEnded) controller.abort(); };
+    let release;
+    const run = { controller, finished: new Promise(resolve => { release = resolve; }) };
+    statusRuns.add(run);res.on('close', cancel);
+    try {
+      const result = await getStatus({ signal: controller.signal });
+      if (res.destroyed || res.writableEnded) return;
+      if (shuttingDown) return replyShutdown(res);
+      res.json({ ...result, busy: Boolean(activeRun || chatReservation), model: MODEL, provider: PROVIDER });
+    } finally {
+      statusRuns.delete(run);release();res.off('close', cancel);
+    }
   });
   const handleModelRequest = (mode) => async (req, res, next) => {
     if (shuttingDown) return replyShutdown(res);
