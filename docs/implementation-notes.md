@@ -22,6 +22,8 @@
 
 同源自主控制权使用 [Web Locks](https://www.w3.org/TR/web-locks/)，短期交互协调使用 [BroadcastChannel](https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts)。后者只发送会过期的状态信号，不发聊天、草稿或记忆。两页同屏的对照用隔离后端固定延迟，避免把网络时延当作打断效果。
 
+按 [Web Storage 标准](https://html.spec.whatwg.org/multipage/webstorage.html#introduction)，不能把共享存储的读后写当成有锁操作。会话偏好单独保存在当前标签页的 [sessionStorage](https://developer.mozilla.org/zh-CN/docs/Web/API/Window/sessionStorage)；另一页改长期称呼时，不会盖掉本页“这次别主动说话”。浏览器复制页面时可能会带一份初始值，后续各页独立。两页同时修改同一份长期记忆仍没有事务保证。
+
 ## 自己检查
 
 - `npm test` 不调用 Astra。缺少本地鲸鱼模型时，专用的几何测试明示跳过；通用协议、计时、导航和公开示例仍可验证。
