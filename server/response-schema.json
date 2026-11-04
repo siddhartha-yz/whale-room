@@ -32,7 +32,8 @@
               "look_at",
               "read",
               "drink",
-              "stretch"
+              "stretch",
+              "move_cup"
             ]
           },
           "target": {
@@ -43,7 +44,9 @@
               "plant",
               "center",
               "user",
-              "none"
+              "none",
+              "cup_inner",
+              "cup_edge"
             ]
           }
         },

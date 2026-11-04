@@ -27,7 +27,7 @@ test('autonomy has no fabricated user message, permits silence, and validates it
   const input = validateAutonomyRequest(idleInput);
   assert.equal(Object.hasOwn(input, 'message'), false);
   assert.deepEqual(input.history, idleInput.history);
-  assert.deepEqual(validateAutonomyReply(idleReply), { ...idleReply, continuationOf: null });
+  assert.deepEqual(validateAutonomyReply(idleReply), { ...idleReply, continuationOf: null, nextIntent: null });
   assert.equal(validateAutonomyReply({ ...idleReply, reply: '你好呀。' }, { canSpeak: false }).reply, '');
   assert.throws(() => validateAutonomyReply({ ...idleReply, activity: '' }), /无效/);
   assert.throws(() => validateAutonomyReply({ ...idleReply, reason: '字'.repeat(201) }), /无效/);

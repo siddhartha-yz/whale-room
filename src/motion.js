@@ -58,11 +58,13 @@ export function stepRoute({ position, path, index = 0, yaw = 0, speed = 0 }, raw
   return next;
 }
 
-/** Turn in place before sitting, then blend from the exact current pose. */
-export function createPostureMotion({ from, to, fromPosition, toPosition, fromYaw, recovery = false }) {
+/** Turn first, then lift clear of the cushion before shifting onto it. */
+export function createPostureMotion({ from, to, fromPosition, toPosition, fromYaw, recovery = false, seatContactCurve = true }) {
   const yawDistance = Math.abs(angleDelta(fromYaw, 0));
-  const turnDuration = recovery ? 0 : Math.min(0.7, yawDistance / 4.3);
-  return {
+  // Smoothstep's peak derivative is 1.5; use the same 2rad/s peak as
+  // calibrated locomotion instead of whipping through a half-turn.
+  const turnDuration = recovery ? 0 : seatContactCurve ? 1.5 * yawDistance / 2 : Math.min(0.7, yawDistance / 4.3);
+  const motion = {
     from, to,
     fromPosition: { x: fromPosition.x, z: fromPosition.z },
     toPosition: { x: toPosition.x, z: toPosition.z },
@@ -70,18 +72,44 @@ export function createPostureMotion({ from, to, fromPosition, toPosition, fromYa
     turnDuration,
     duration: recovery ? Math.max(0.22, Math.abs(to - from) * 0.9) : 1.45,
     elapsed: 0,
-    recovery,
+    recovery, seatContactCurve: Boolean(seatContactCurve),
   };
+  if (seatContactCurve) {
+    // Calibrated for the current short-legged avatar. Callers select the old
+    // simultaneous path for replacement models without this calibration.
+    const stageDuration = 1.9 * .55;
+    if (recovery) {
+      const distance = Math.hypot(toPosition.x - fromPosition.x, toPosition.z - fromPosition.z);
+      const poseDistance = Math.abs(to - from);
+      motion.poseDuration = poseDistance > 1e-6 ? Math.max(.22, stageDuration * Math.sqrt(poseDistance)) : 0;
+      motion.moveDuration = distance > 1e-6 ? Math.max(.22, stageDuration * distance / .46) : 0;
+      // A cancellation must not shortcut diagonally through the cushion.
+      // Full seated blend can still occur in front of the final seat position.
+      motion.poseStart = to ? 0 : motion.moveDuration;
+      motion.moveStart = to ? motion.poseDuration : 0;
+      motion.duration = Math.max(.22, motion.poseDuration + motion.moveDuration);
+    } else {
+      motion.duration = 1.9;
+      motion.poseDuration = motion.moveDuration = stageDuration;
+      motion.poseStart = to ? 0 : motion.duration * .45;
+      motion.moveStart = to ? motion.duration * .45 : 0;
+    }
+  }
+  return motion;
 }
 
 export function samplePosture(motion, elapsed) {
   const turned = motion.turnDuration ? smooth(elapsed / motion.turnDuration) : 1;
-  const amount = smooth((elapsed - motion.turnDuration) / motion.duration);
+  const localTime = elapsed - motion.turnDuration;
+  const amount = smooth(localTime / motion.duration);
+  const stage = (start, duration) => duration > 0 ? smooth((localTime - start) / duration) : (localTime >= start ? 1 : 0);
+  const poseAmount = motion.seatContactCurve ? stage(motion.poseStart, motion.poseDuration) : amount;
+  const moveAmount = motion.seatContactCurve ? stage(motion.moveStart, motion.moveDuration) : amount;
   return {
-    blend: mix(motion.from, motion.to, amount),
+    blend: mix(motion.from, motion.to, poseAmount),
     position: {
-      x: mix(motion.fromPosition.x, motion.toPosition.x, amount),
-      z: mix(motion.fromPosition.z, motion.toPosition.z, amount),
+      x: mix(motion.fromPosition.x, motion.toPosition.x, moveAmount),
+      z: mix(motion.fromPosition.z, motion.toPosition.z, moveAmount),
     },
     yaw: motion.recovery ? motion.fromYaw : motion.fromYaw + angleDelta(motion.fromYaw, 0) * turned,
     done: elapsed >= motion.turnDuration + motion.duration,

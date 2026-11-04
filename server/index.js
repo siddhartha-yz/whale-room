@@ -4,11 +4,23 @@ import { fileURLToPath } from 'node:url';
 import { MODEL, PROVIDER, ROOT, CompanionError, validateRequest, validateReply, validateAutonomyRequest, validateAutonomyReply, loginStatus, runCompanion } from './companion.js';
 import { inspectionRouter } from './inspection.js';
 
+const SHUTTING_DOWN = { error: '本地服务正在停止。', code: 'SHUTTING_DOWN' };
+const replyShutdown = res => res.set('Connection', 'close').status(503).json(SHUTTING_DOWN);
+
 export function createApp({ runner = runCompanion, getStatus = loginStatus, inspectionDirectory, now = Date.now } = {}) {
   const app = express();
   app.disable('x-powered-by');
   let activeRun = null;
   let chatReservation = null;
+  let shuttingDown = false, shutdownWork;
+  app.locals.stopCompanion = () => {
+    if (shuttingDown) return shutdownWork;
+    shuttingDown = true;
+    shutdownWork = activeRun?.finished ?? Promise.resolve();
+    chatReservation?.abort();
+    activeRun?.controller.abort();
+    return shutdownWork;
+  };
   const autonomyStarts = [];
   const autonomyWindowMs = 3_600_000;
   const autonomyLimit = 24;
@@ -22,6 +34,7 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
         return res.status(403).json({ error: '只允许从当前原型页面调用。', code: 'INVALID_ORIGIN' });
       }
       res.setHeader('Cache-Control', 'no-store');
+      if (shuttingDown) return replyShutdown(res);
     }
     next();
   });
@@ -34,6 +47,7 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
     res.json({ ...result, busy: Boolean(activeRun || chatReservation), model: MODEL, provider: PROVIDER });
   });
   const handleModelRequest = (mode) => async (req, res, next) => {
+    if (shuttingDown) return replyShutdown(res);
     if (!req.is('application/json')) return res.status(415).json({ error: '请使用 JSON 请求。', code: 'INVALID_CONTENT_TYPE' });
     let input;
     try { input = mode === 'autonomy' ? validateAutonomyRequest(req.body) : validateRequest(req.body); } catch (error) { return next(error); }
@@ -47,8 +61,10 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
     };
     res.on('close', cancel);
     let slot;
-    const replyPreempted = () => {
-      if (slot?.preempted && !res.destroyed && !res.writableEnded) {
+    const replyInterrupted = () => {
+      if (res.destroyed || res.writableEnded) return;
+      if (shuttingDown) replyShutdown(res);
+      else if (slot?.preempted) {
         res.status(409).json({ error: '已优先处理你的消息。', code: 'PREEMPTED' });
       }
     };
@@ -66,10 +82,10 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
         if (previous.mode === 'autonomy') previous.preempted = true;
         previous.controller.abort();
         await previous.finished;
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted) { replyInterrupted(); return; }
         if (chatReservation === controller) chatReservation = null;
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) { replyInterrupted(); return; }
       if (mode === 'autonomy') {
         const time = now();
         while (autonomyStarts.length && autonomyStarts[0] <= time - autonomyWindowMs) autonomyStarts.shift();
@@ -87,14 +103,14 @@ export function createApp({ runner = runCompanion, getStatus = loginStatus, insp
       slot = { mode, controller, finished, release, preempted: false };
       activeRun = slot;
       const result = await runner(input, { signal: controller.signal, mode });
-      if (controller.signal.aborted) { replyPreempted(); return; }
+      if (controller.signal.aborted) { replyInterrupted(); return; }
       // The runner also returns transport metadata; only the model payload uses the strict schema.
       const payload = { reply: result?.reply, expression: result?.expression, actions: result?.actions };
       const validated = mode === 'autonomy'
-        ? validateAutonomyReply({ ...payload, activity: result?.activity, reason: result?.reason, dwellSeconds: result?.dwellSeconds, continuationOf: result?.continuationOf }, { ...input.autonomy, world: input.world })
-        : validateReply({ ...payload, memoryPatch: result?.memoryPatch }, { message: input.message, memory: input.memory });
+        ? validateAutonomyReply({ ...payload, activity: result?.activity, reason: result?.reason, dwellSeconds: result?.dwellSeconds, continuationOf: result?.continuationOf, nextIntent: result?.nextIntent }, { ...input.autonomy, world: input.world })
+        : validateReply({ ...payload, memoryPatch: result?.memoryPatch }, { message: input.message, memory: input.memory, world: input.world });
       res.json({ ...validated, model: MODEL, provider: PROVIDER, elapsedMs: result.elapsedMs, usage: result.usage });
-    } catch (error) { if (controller.signal.aborted) replyPreempted(); else next(error); }
+    } catch (error) { if (controller.signal.aborted) replyInterrupted(); else next(error); }
     finally {
       if (activeRun === slot) activeRun = null;
       slot?.release();
@@ -131,7 +147,19 @@ export async function startServer({ port = Number(process.env.PORT || 4317), dev
   }
   const server = app.listen(port, '127.0.0.1', () => console.log(`鲸鱼娘 · 本地房间  http://127.0.0.1:${port}\n${offline ? '离线场景模式 · 不调用模型' : 'GPT-6 Astra · 可选使用本机 Codex 登录'}`));
   server.on('error', (error) => { console.error(error.code === 'EADDRINUSE' ? `端口 ${port} 已被使用。` : '无法启动本地服务。'); process.exitCode = 1; });
-  const close = async () => { await vite?.close(); server.close(() => process.exit(0)); };
+  let closing = false;
+  const close = async () => {
+    if (closing) return;
+    closing = true;
+    const work = app.locals.stopCompanion();
+    const socketDrain = new Promise(resolve => server.close(resolve));
+    // The CLI bridge gives an aborted child 1.5 seconds before killing it.
+    // Keep the parent alive for that cleanup, including on disconnected fetches.
+    const force = setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 3000);
+    force.unref();
+    await Promise.allSettled([work, socketDrain, vite?.close()]);
+    clearTimeout(force); process.exit(0);
+  };
   process.once('SIGINT', close);
   process.once('SIGTERM', close);
   return server;

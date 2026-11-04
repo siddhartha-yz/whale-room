@@ -5,6 +5,8 @@ const MAX_ENTRIES = 24;
 const text = (value, length = 200) => typeof value === 'string' ? value.slice(0, length) : '';
 const seconds = (value) => Number.isFinite(value) && value >= 0 ? Math.min(value, WEEK_MS / 1000) : 0;
 const timestamp = (value, now) => Number.isFinite(value) && value >= 0 ? Math.min(value, now) : null;
+const marker = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(value) ? value : null;
+const revision = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 export function activityWorld(world = {}) {
   if (!world || typeof world !== 'object') world = {};
@@ -68,6 +70,7 @@ export function sanitizeActivityJournal(value, now = Date.now()) {
     }));
   return {
     version: VERSION, savedAt: timestamp(value.savedAt, now),
+    writerId: marker(value.writerId), revision: marker(value.revision),
     currentActivity: currentActivity(value.currentActivity, now), recentActivities,
     requestTimes: (Array.isArray(value.requestTimes) ? value.requestTimes.slice(-24) : [])
       .filter((time) => Number.isFinite(time) && time > now - HOUR_MS)
@@ -95,9 +98,15 @@ export function createActivityJournal({ storage, key = 'room-companion-activity-
         const time = now();
         // Reading old observations never makes them fresh. Only an actual
         // write without a supplied observation time receives the current time.
-        const data = sanitizeActivityJournal(value?.savedAt === undefined ? { ...value, savedAt: time } : value, time);
-        if (data) storage?.setItem(key, JSON.stringify(data));
-      } catch { /* Local storage can be disabled or full; the room still works. */ }
+        const data = sanitizeActivityJournal({ ...value,
+          savedAt: value?.savedAt === undefined ? time : value.savedAt, revision: revision() }, time);
+        if (!data || typeof storage?.setItem !== 'function' || typeof storage?.getItem !== 'function') return null;
+        const serialized = JSON.stringify(data);
+        storage.setItem(key, serialized);
+        // A recovery proof requires a confirmed write, not a best-effort save.
+        // Every write has a fresh revision even when two writers share a clock.
+        return storage.getItem(key) === serialized ? data : null;
+      } catch { return null; /* Local storage can be disabled or full. */ }
     },
     clear() {
       try { storage?.removeItem(key); } catch { /* Best effort, like save. */ }

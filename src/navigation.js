@@ -1,24 +1,29 @@
 // Coordinates describe the character's centre on the room's X/Z floor plane.
 export const NAV_BOUNDS = Object.freeze({
-  minX: -3.65, maxX: 3.65, minZ: -2.85, maxZ: 2.85,
+  minX: -3.30, maxX: 3.65, minZ: -2.60, maxZ: 2.85,
 });
 
+export const SIDE_TABLE = Object.freeze({ x: -2.97, z: -2.28, radius: .33 });
 export const OBSTACLES = Object.freeze([
   Object.freeze({ name: 'sofa', minX: -2.5, maxX: 0.9, minZ: -2.9, maxZ: -1.65 }),
   Object.freeze({ name: 'coffeeTable', minX: -0.85, maxX: 0.85, minZ: 0, maxZ: 1 }),
   Object.freeze({ name: 'plant', minX: 2.65, maxX: 3.45, minZ: -2.8, maxZ: -2.05 }),
   Object.freeze({ name: 'cabinet', minX: 2.95, maxX: 3.75, minZ: -1.65, maxZ: 0.8 }),
+  Object.freeze({ name: 'sideTable', minX: SIDE_TABLE.x-SIDE_TABLE.radius, maxX: SIDE_TABLE.x+SIDE_TABLE.radius,
+    minZ: SIDE_TABLE.z-SIDE_TABLE.radius, maxZ: SIDE_TABLE.z+SIDE_TABLE.radius }),
 ]);
 
 const BODY_CLEARANCE = 0.23;
 // Turning near the table also sweeps the chibi's long, low hair. Interaction
 // stations use the smaller body corridor only while holding a safe facing yaw.
-const TABLE_CLEARANCE = 0.60;
+// Other furniture leaves room for the head and hair at each height. These
+// margins retain the named places; they do not model the full tail sweep.
+const ROOM_CLEARANCE = Object.freeze({ coffeeTable: .60, sideTable: .62, cabinet: .58, plant: .48, sofa: .35 });
 const GRID_STEP = 0.16;
 const EPSILON = 1e-9;
 function expand(bodyOnly) {
   return OBSTACLES.map((rect) => {
-    const margin = rect.name === 'coffeeTable' && !bodyOnly ? TABLE_CLEARANCE : BODY_CLEARANCE;
+    const margin = rect.name === 'coffeeTable' && bodyOnly ? BODY_CLEARANCE : ROOM_CLEARANCE[rect.name] ?? BODY_CLEARANCE;
     return { minX: rect.minX - margin, maxX: rect.maxX + margin, minZ: rect.minZ - margin, maxZ: rect.maxZ + margin };
   });
 }

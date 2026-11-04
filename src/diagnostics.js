@@ -1,6 +1,8 @@
 /** Local render inspection and optional same-origin evidence export; no model calls. */
-export function installDiagnostics({ avatar, renderer, scene, camera, getWorldState, getAutonomyState = () => null, getFeedback = () => [], getSimulationTime = () => null, getRenderPresence = () => null, setPaused, step }) {
-  if (new URLSearchParams(location.search).get('inspect') !== '1') return;
+export function installDiagnostics({ avatar, renderer, scene, camera, getWorldState, getAutonomyState = () => null, getFeedback = () => [], getSimulationTime = () => null, getCameraAvoidance = () => null, getRenderPresence = () => null, getPageLifecycle = () => null, setPaused, step, setFrameProbe }) {
+  const params = new URLSearchParams(location.search);
+  if (params.get('inspect') !== '1') return;
+  const traceIntervalMs = params.get('soak') === '1' ? 2000 : 500;
   const panel = document.createElement('details');
   panel.id = 'render-inspector';
   panel.open = true;
@@ -28,6 +30,8 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
   let simulationStart = 0, simulationStoppedAt = null, steppedSeconds = 0;
   let samples = [];
   let events = [];
+  let lifecycle = [];
+  let frameProbe = false;
   let lastEventKey = '';
   let frames = 0;
   let inactiveFrames = 0;
@@ -35,13 +39,14 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
   let closedStreak = 0;
   let longestClosedStreak = 0;
   let last = performance.now();
-  let lastSample = -Infinity;
+  let observedFrameAt = null;
+  let lastSample = -Infinity, lastTraceSample = -Infinity;
   let intervals = [];
   let stoppedAt = null;
   let previousPose = null;
   let maxStepMeters = 0;
   let maxPoseStep = 0;
-  let maxYawStep = 0;
+  let maxYawStep = 0, maxCameraStep = 0, framingFrames = 0, framingJumps = 0, framingUnresolved = 0;
   let requestId;
   const round = value => Math.round(value * 1000) / 1000;
   function base64(bytes) {
@@ -55,14 +60,23 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
     element.textContent = text; element.style.cssText = 'padding:3px 6px;background:#eaf0f8;border-radius:4px';
     element.addEventListener('click', handler); controls.append(element); return element;
   }
+  function recordLifecycle(event) {
+    if (!recording || lifecycle.length >= 128) return;
+    lifecycle.push({ seconds: round((performance.now()-start)/1000),
+      type: event.type, visibility: document.visibilityState, pageLifecycle: getPageLifecycle(),
+      ...(typeof event.persisted === 'boolean' ? { persisted: event.persisted } : {}) });
+  }
+  for (const type of ['visibilitychange','freeze','resume']) document.addEventListener(type,recordLifecycle);
+  for (const type of ['pagehide','pageshow']) window.addEventListener(type,recordLifecycle);
   function summary() {
     const sorted = intervals.slice().sort((a, b) => a - b);
     return {
       durationSeconds: round(((stoppedAt ?? performance.now()) - start) / 1000),
       animationSeconds: round((simulationStoppedAt ?? getSimulationTime() ?? 0) - simulationStart), manuallySteppedSeconds: round(steppedSeconds),
-      frames, inactiveFrames, closedFrames, longestClosedSeconds: round(longestClosedStreak),
+      frames, inactiveFrames, traceIntervalMs, closedFrames, longestClosedSeconds: round(longestClosedStreak),
       closedFraction: frames ? round(closedFrames / frames) : 0,
-      maxStepMeters: round(maxStepMeters), maxPoseStep: round(maxPoseStep), maxYawStepRadians: round(maxYawStep),
+      maxStepMeters: round(maxStepMeters), maxPoseStep: round(maxPoseStep), maxYawStepRadians: round(maxYawStep), maxCameraStepMeters: round(maxCameraStep),
+      framingFrames, framingJumps, framingUnresolved,
       recentFrameMedianMs: round(sorted[Math.floor(sorted.length * 0.5)] || 0),
       recentFrameP95Ms: round(sorted[Math.floor(sorted.length * 0.95)] || 0),
       renderer: { calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures },
@@ -72,6 +86,7 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
   if (setPaused && step) {
     const pauseButton = button('暂停动画', () => {
       paused = !paused; setPaused(paused);
+      previousPose = null; closedStreak = 0;
       pauseButton.textContent = paused ? '恢复动画' : '暂停动画';
       stepButton.disabled = !paused;
       captureSample(performance.now());
@@ -81,6 +96,14 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
       try { await step(0.2); if(recording)steppedSeconds+=0.2; } finally { stepButton.disabled = !paused; captureSample(performance.now()); }
     });
     stepButton.disabled = true;
+  }
+  if (setFrameProbe) {
+    const probeButton = button('模拟限帧（1 FPS）', () => {
+      frameProbe = !frameProbe;
+      setFrameProbe(frameProbe);
+      probeButton.textContent = frameProbe ? '结束模拟限帧' : '模拟限帧（1 FPS）';
+      captureSample(performance.now());
+    });
   }
   async function persist(kind, base64, link) {
     delete link.dataset.path;
@@ -99,7 +122,7 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
     }
   }
   async function updateExport() {
-    const data = { recordedAt: new Date().toISOString(), summary: summary(), samples, events };
+    const data = { recordedAt: new Date().toISOString(), summary: summary(), samples, events, lifecycle };
     const json = JSON.stringify(data);
     dataLink.href = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
     dataLink.download = `whale-render-${Date.now()}.json`; dataLink.hidden = false;
@@ -108,10 +131,11 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
   }
   const recordButton = button('开始记录', () => {
     if (!recording) {
-      samples = []; events = []; lastEventKey = ''; frames = 0; inactiveFrames = 0; closedFrames = 0; closedStreak = 0; longestClosedStreak = 0;
-      intervals = []; start = performance.now(); stoppedAt = null; lastSample = -Infinity;
+      samples = []; events = []; lifecycle = []; lastEventKey = ''; frames = 0; inactiveFrames = 0; closedFrames = 0; closedStreak = 0; longestClosedStreak = 0;
+      intervals = []; start = performance.now(); stoppedAt = null; lastSample = -Infinity; lastTraceSample = -Infinity;
       simulationStart=getSimulationTime()||0;simulationStoppedAt=null;steppedSeconds=0;
-      previousPose = null; maxStepMeters = 0; maxPoseStep = 0; maxYawStep = 0;
+      previousPose = null; maxStepMeters = 0; maxPoseStep = 0; maxYawStep = 0; maxCameraStep = 0;
+      framingFrames = 0; framingJumps = 0; framingUnresolved = 0;
       recording = true; recordButton.textContent = '停止记录'; dataLink.hidden = true;
     } else {
       recording = false; stoppedAt = performance.now(); simulationStoppedAt=getSimulationTime()||0;recordButton.textContent = '开始记录'; updateExport();
@@ -149,13 +173,21 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
   });
   function tick(now) {
     requestId = requestAnimationFrame(tick);
-    const interval = now - last; last = now;
+    const callbackInterval = now - last; last = now;
     if (document.hidden) return;
     const face = avatar.getState();
-    const renderActive = getRenderPresence()?.active !== false;
-    if(recording&&!paused&&!renderActive){inactiveFrames++;closedStreak=0;previousPose=null;}
-    if (recording && !paused && renderActive) {
+    const presence = getRenderPresence();
+    const renderActive = presence?.active !== false;
+    const delivered = !presence || (presence.lastFrameAt !== null && presence.lastFrameAt !== observedFrameAt);
+    if (delivered) observedFrameAt = presence?.lastFrameAt ?? null;
+    if(recording&&!paused&&!renderActive){if(delivered)inactiveFrames++;closedStreak=0;previousPose=null;}
+    if (recording && !paused && renderActive && delivered) {
+      const interval = presence?.rawDeltaMs ?? callbackInterval;
       frames++;
+      const framing = getCameraAvoidance();
+      if (framing?.framingFallback) framingFrames++;
+      if (framing?.framingJump) framingJumps++;
+      if (framing?.framingUnresolved) framingUnresolved++;
       if (interval > 0 && interval < 2000) {
         intervals.push(interval); if (intervals.length > 3600) intervals.shift();
       }
@@ -164,11 +196,13 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
       else closedStreak = 0;
       longestClosedStreak = Math.max(longestClosedStreak, closedStreak);
       const position = avatar.root.position;
-      const pose = { x: position.x, z: position.z, blend: face.sitBlend, yaw: avatar.root.rotation.y };
+      const {x:cx,y:cy,z:cz}=camera.position;
+      const pose = { x: position.x, z: position.z, blend: face.sitBlend, yaw: avatar.root.rotation.y,cx,cy,cz };
       if (previousPose) {
         maxStepMeters = Math.max(maxStepMeters, Math.hypot(pose.x - previousPose.x, pose.z - previousPose.z));
         maxPoseStep = Math.max(maxPoseStep, Math.abs(pose.blend - previousPose.blend));
         maxYawStep = Math.max(maxYawStep, Math.abs(Math.atan2(Math.sin(pose.yaw - previousPose.yaw), Math.cos(pose.yaw - previousPose.yaw))));
+        maxCameraStep = Math.max(maxCameraStep, Math.hypot(cx-previousPose.cx,cy-previousPose.cy,cz-previousPose.cz));
       }
       previousPose = pose;
     }
@@ -182,31 +216,57 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
     const autonomy = getAutonomyState();
     const feedback = getFeedback().slice(-8);
     const current = autonomy?.currentActivity;
+    const reading = world.reading;
+    const readingGaze = face.readingGaze;
+    const avoidance = getCameraAvoidance();
     const compactAutonomy = autonomy ? {
       enabled: autonomy.enabled, status: autonomy.status, activity: autonomy.activity,
       requestCount: autonomy.requestCount,
       lastDecisionSpeechAllowed: autonomy.lastDecisionSpeechAllowed ?? null,
+      recoveredQuietDwell: autonomy.recoveredQuietDwell === true,
       lastDecisionAt: autonomy.lastDecisionAt ?? null,
-      currentActivity: current ? { id: current.id, phase: current.phase, elapsedVisibleSeconds: current.elapsedVisibleSeconds, dwellComplete: current.dwellComplete } : null,
+      ...(autonomy.nextIntent ? { nextIntent: autonomy.nextIntent } : {}),
+      ...(autonomy.lastIntentEvent ? { lastIntentEvent: autonomy.lastIntentEvent } : {}),
+      currentActivity: current ? { id: current.id, phase: current.phase, elapsedVisibleSeconds: current.elapsedVisibleSeconds, segmentVisibleSeconds: current.segmentVisibleSeconds, dwellComplete: current.dwellComplete } : null,
     } : null;
     const sample = {
       seconds: recording ? round((now - start) / 1000) : null,
       simulationSeconds: round(getSimulationTime() || 0), paused,
+      visibility: document.visibilityState, frameProbe, pageLifecycle: getPageLifecycle(),
       renderPresence: getRenderPresence(),
-      camera: { position: { x: round(camera.position.x), y: round(camera.position.y), z: round(camera.position.z) }, aspect: round(camera.aspect) },
+      camera: { position: { x: round(camera.position.x), y: round(camera.position.y), z: round(camera.position.z) }, aspect: round(camera.aspect),
+        ...(avoidance ? { avoidance: { mode: avoidance.mode, lift: round(avoidance.lift), distance: round(avoidance.distance), occluded: avoidance.occluded,
+          ...(avoidance.framingFallback ? { framingFallback: true, framingReason: avoidance.framingReason } : {}) } } : {}) },
       world: { position: world.position, posture: world.posture, expression: world.expression, location: world.location, gaze: world.gaze, activity: world.activity, yaw: round(avatar.root.rotation.y) },
-      face: { expression: face.expression, attention: face.attention, blink: round(face.blink), speaking: face.speaking, gesture: face.gesture, sitBlend: round(face.sitBlend), walkBlend: round(face.walkBlend), gaze: face.gaze, channels: face.channels, splitRig: face.facialRig },
+      reading: reading ? { status: reading.status, pageIndex: reading.pageIndex, pageReadSeconds: round(reading.pageReadSeconds), readPageIds: reading.readPageIds, allPagesRead: reading.allPagesRead } : null,
+      ...(world.cup ? { cup: world.cup } : {}),
+      face: { expression: face.expression, attention: face.attention, blink: round(face.blink), speaking: face.speaking, gesture: face.gesture, sitBlend: round(face.sitBlend), walkBlend: round(face.walkBlend), gaze: face.gaze, channels: face.channels, splitRig: face.facialRig,
+        ...(face.responseCueActive ? { responseCuePitch: round(face.responseCuePitch) } : {}) },
       activity: face.activity, activityResult: face.activityResult,
+      ...(readingGaze?.active ? { readingGaze: { scanning: readingGaze.scanning, line: readingGaze.line,
+        fixation: round(readingGaze.fixation), targetLocal: readingGaze.targetLocal?.map(round) } } : {}),
+      ...(face.tailGround?.enabled ? { tailGround: face.tailGround } : {}),
       autonomy: compactAutonomy,
     };
-    const eventKey = JSON.stringify([autonomy?.status, autonomy?.activity, autonomy?.requestCount, current?.id, current?.phase, feedback.map(item=>item.id)]);
+    const eventKey = JSON.stringify([sample.renderPresence?.active, frameProbe, autonomy?.status, autonomy?.activity, autonomy?.requestCount, current?.id, current?.phase, autonomy?.lastIntentEvent?.sequence, reading?.status, reading?.pageIndex, reading?.readPageIds, feedback.map(item=>item.id)]);
     if(recording && eventKey !== lastEventKey){
       lastEventKey=eventKey;
-      events.push({ seconds:sample.seconds, autonomy, feedback });
+      events.push({ seconds:sample.seconds, visibility:sample.visibility, frameProbe, renderActive:sample.renderPresence?.active, reading:sample.reading, autonomy, feedback });
     }
-    if (recording && samples.length < 7200) samples.push(sample);
+    if (recording && samples.length < 7200 && now - lastTraceSample >= traceIntervalMs) { samples.push(sample); lastTraceSample = now; }
     readout.textContent = JSON.stringify({ recording, ...sample, feedback, metrics: frames ? summary() : undefined }, null, 2);
   }
-  requestId = requestAnimationFrame(tick);
-  window.addEventListener('pagehide', () => cancelAnimationFrame(requestId), { once: true });
+  function startInspectionFrames() {
+    if (requestId != null) return;
+    last = performance.now(); observedFrameAt = null; previousPose = null; closedStreak = 0;
+    requestId = requestAnimationFrame(tick);
+  }
+  startInspectionFrames();
+  window.addEventListener('pagehide', () => {
+    if (requestId != null) cancelAnimationFrame(requestId);
+    requestId = null;
+  });
+  window.addEventListener('pageshow', event => {
+    if (event.persisted) startInspectionFrames();
+  });
 }

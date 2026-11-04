@@ -91,3 +91,32 @@ test('changing expressions mid-blink stays within a single eyelid closure budget
     assert.ok(Number.isFinite(total) && total >= 0 && total <= 1 + 1e-9);
   }
 });
+
+test('a response has one bounded head cue without inventing audio mouth motion', () => {
+  const face = makeFace(); face.setAttention('responding');
+  let peak = 0;
+  for (let i = 0; i < 4 * 120; i++) {
+    if (i % 18 === 0) face.setAttention('responding');
+    const frame = face.update(1 / 120);
+    peak = Math.max(peak, frame.responseCuePitch);
+    assert.equal(frame.vowels.aa + frame.vowels.ih + frame.vowels.ou, 0);
+    if (i > 132) assert.equal(frame.responseCuePitch, 0, 'repeated notifications must not restart the cue');
+  }
+  assert.ok(peak > .054 && peak <= .055);
+  assert.equal(face.getState().responseCueActive, false);
+});
+
+test('blocked or interrupted response cues are consumed instead of replaying when allowed', () => {
+  for (const blocked of [{ moving: true }, { responseCueAllowed: false }]) {
+    const face = makeFace(); face.setAttention('responding');
+    face.update(0, blocked);
+    assert.equal(face.getState().responseCueActive, false);
+    face.setAttention('responding');
+    for (let i = 0; i < 120; i++) assert.equal(face.update(1 / 120).responseCuePitch, 0);
+    face.setAttention('idle'); face.setAttention('responding');
+    assert.ok(advance(face, .4).responseCuePitch > .03, 'a new response entry can have its own cue');
+    face.setAttention('listening');
+    assert.equal(face.getState().responseCueActive, false);
+    assert.equal(face.getState().responseCuePitch, 0);
+  }
+});

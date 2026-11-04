@@ -74,7 +74,8 @@ test('the real calibrated seat exits through the approach before either station 
       walk(stood.position, staging(station)); walk(staging(station), floorPoint(station), stationOptions);
       walk(floorPoint(station), staging(station), stationOptions); walk(staging(station), origins.sofa);
       const sit = createPostureMotion({ from: 0, to: 1, fromPosition: origins.sofa, toPosition: seat, fromYaw: Math.PI });
-      const seated = samplePosture(sit, 3);
+      assert.ok(sit.turnDuration + sit.duration < 4.3, 'half-turn plus safe climbing remains bounded');
+      const seated = samplePosture(sit, sit.turnDuration + sit.duration);
       assert.equal(seated.done, true); assert.equal(seated.blend, 1); assert.deepEqual(seated.position, seat);
     }
   } finally { avatar.dispose(); }

@@ -12,13 +12,20 @@ import { createActivityJournal } from './activity-journal.js';
 import { createAutonomyOwner } from './autonomy-owner.js';
 import { createConversation } from './conversation.js';
 import { createConversationScope } from './conversation-scope.js';
-import { constrainRoomCamera, sampleCameraOrbit } from './camera.js';
+import { constrainRoomCamera, sampleCameraOrbit, resolveCameraOcclusion } from './camera.js';
 import { captureChatReadingResult, tryAdoptChatReading } from './chat-activity.js';
 import { createRenderPresence } from './render-presence.js';
+import { createPageLifecycle } from './page-lifecycle.js';
+import { createBookObservation, ROOM_BOOK } from './book-observation.js';
+import { createConnectionStatus } from './connection-status.js';
+import { postLocalJson, invalidLocalResponse, hasActionList } from './local-request.js';
 
 const $ = selector => document.querySelector(selector);
 const room = createRoom($('#room'));
-const {scene,camera,renderer,controls,ground,marker}=room;
+const {scene,camera,orbitCamera,renderer,controls,marker}=room;
+const readingBook=createBookObservation();
+let bookView=readingBook.getState();
+room.activities?.setBookSpread(ROOM_BOOK,bookView.pageIndex);
 const places = {
   center:{x:0,z:1.65,label:'房间中央'},
   window:{x:-3,z:-.5,label:'窗边'},
@@ -37,7 +44,16 @@ const gazeTargets = {
 };
 const seat = {x:-.85,z:-1.97};
 const expressionNames={neutral:'平静',happy:'开心',sad:'难过',surprised:'惊讶',relaxed:'放松'};
-const inspectionMode=new URLSearchParams(location.search).get('inspect')==='1';
+const roomParams=new URLSearchParams(location.search);
+const inspectionMode=roomParams.get('inspect')==='1';
+const frameProbeEnabled=inspectionMode&&roomParams.get('frameProbe')==='1';
+const allowNextIntent=!(inspectionMode&&roomParams.get('nextIntent')==='0');
+const attentionCueEnabled=!(inspectionMode&&roomParams.get('attentionCue')==='0');
+const seatContactEnabled=!(inspectionMode&&roomParams.get('seatContactCurve')==='0');
+const minimumFramingDistance=inspectionMode&&roomParams.get('cameraFraming')==='0'?0:1.1;
+const tailGround=inspectionMode&&roomParams.get('tailGround')==='1';
+const readAlongPage=inspectionMode&&roomParams.get('readAlongPage')==='1';
+const cupShift=inspectionMode&&roomParams.get('cupShift')==='1';
 const storeKey=inspectionMode?'room-companion-inspection-history-v1':'room-companion-history-v1';
 const autonomyStoreKey=inspectionMode?'room-inspection-autonomy-enabled':'room-autonomy-enabled';
 const activityClearKey=inspectionMode?'room-inspection-clear-activities':'room-clear-activities';
@@ -51,10 +67,12 @@ const settleWaiters=[];
 let currentLook='user', activityLookLease=null, speechTimer=null, speechVersion=0, initialized=false, busy=false, closeView=false;
 let autonomy=null, actionOwner=null, providerAvailable=false;
 let autonomyOwner=null, pendingUserEvent=false, pendingConversation=false, pendingSpeech=false, pendingActivityClear=false;
+let quietDwellFrameGap=false, quietDwellRecovery=null;
 let manualAction=null;
-let cameraManuallyAdjusted=false;
+let cameraManuallyAdjusted=false,cameraAvoidance=null;
 let inspectionPaused=false;
-let lastInputAt=0, feedbackSequence=0;
+let frameProbeLastAt=null;
+let lastInputAt=0, composingMessage=false, feedbackSequence=0;
 let autonomyEnabled=!inspectionMode;
 try {const saved=localStorage.getItem(autonomyStoreKey);if(saved!==null)autonomyEnabled=saved!=='false';} catch{}
 const followAnchor=new THREE.Vector3();
@@ -64,11 +82,18 @@ let conversationEpoch=0, conversationOpening=Promise.resolve(), conversationRele
 let activeDelivery=null, pageLeaving=false, conversationRendered=false;
 let toastTimer;
 let memoryControls;
-const renderPresence=createRenderPresence({onChange:({active})=>{
-  if(!active){autonomy?.pauseForHidden();stopSpeech();avatar?.setAttention?.('idle');}
+const connectionStatus=createConnectionStatus({onChange:renderConnection});
+const renderPresence=createRenderPresence({onChange:({active,reason})=>{
+  if(!active){
+    quietDwellFrameGap=Boolean(autonomy&&reason==='frame-gap'&&!document.hidden&&!pageLifecycle.isBlocked()&&!inspectionPaused);
+    if(!quietDwellFrameGap)quietDwellRecovery=null;
+    autonomy?.pauseForHidden();stopSpeech();avatar?.setAttention?.('idle');
+  }
+  else if(busy)avatar?.setAttention?.('thinking');
   refreshAutonomyOwnership();
 }});
-function roomIsActive(){return !document.hidden&&!inspectionPaused&&renderPresence.getState().active;}
+const pageLifecycle=createPageLifecycle({hidden:document.hidden,onChange:handlePageLifecycle});
+function roomIsActive(){return !document.hidden&&!pageLifecycle.isBlocked()&&!inspectionPaused&&renderPresence.getState().active;}
 setInterval(()=>renderPresence.check(),250);
 const memory = createMemoryStore({
   key:inspectionMode?'room-companion-inspection-memory-v1':'room-companion-memory-v1',
@@ -81,10 +106,11 @@ const activityJournal = createActivityJournal({
 
 function toast(message){$('#toast').textContent=message;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,4200);}
 function message(role,content,type=''){
+  const log=$('#messages'),follow=role==='user'||log.scrollHeight-log.clientHeight-log.scrollTop<36;
   $('.welcome')?.remove();
   const el=document.createElement('div');el.className='message '+role+' '+type;
   if(type!=='event'){const who=document.createElement('div');who.className='who';who.textContent=role==='user'?'你':type==='error'?'连接提示':'鲸鱼娘';el.append(who);}
-  const bubble=document.createElement('div');bubble.className='bubble';bubble.textContent=content;el.append(bubble);$('#messages').append(el);$('#messages').scrollTop=$('#messages').scrollHeight;
+  const bubble=document.createElement('div');bubble.className='bubble';bubble.textContent=content;el.append(bubble);log.append(el);if(follow)log.scrollTop=log.scrollHeight;
 }
 const deliveryLabels={cancelled:'这次回复已取消。',interrupted:'上次回复未完成。',failed:'这次回复未完成。'};
 function openConversation(){
@@ -112,12 +138,14 @@ function lookAt(target){currentLook=target;activityLookLease=null;}
 function lookAtProp(target){currentLook=target;return activityLookLease={target};}
 function releasePropLook(lease){if(lease&&activityLookLease===lease){currentLook='user';activityLookLease=null;}}
 function setExpression(name,options={}){if(!avatar?.setExpression(name,options))return;state.expression=name;document.querySelectorAll('[data-expression]').forEach(b=>b.classList.toggle('selected',b.dataset.expression===name));}
+function currentCup(){return room.activities?.getCupState?.();}
+function cupSpotLabel(spot){return spot==='cup_inner'?'内侧杯垫':spot==='cup_edge'?'外侧杯垫':null;}
 function presence(){
   const labels={idle:'站着',walking:'走动中',sitting:'正在坐下',seated:'坐着',standing_up:'正在起身'};
   const activity=avatar?.getState().activity;
-  const activityLabels={read:'看书',drink:'喝水',stretch:'伸展'};
+  const activityLabels={read:'看书',drink:'喝水',stretch:'伸展',move_cup:'挪杯子'};
   $('#presence').textContent=activity
-    ? activity.cancelling?'停下来':activityLabels[activity.name]||'活动中'
+    ? activity.blocked?'拿着杯子':activity.cancelling?'停下来':activityLabels[activity.name]||'活动中'
     : labels[state.mode]||'在这里';
 }
 function flushSettleWaiters(){
@@ -133,12 +161,14 @@ function waitForRest(token){
   if(!brakingMotion&&!transition&&!activityExit)return Promise.resolve(true);
   return new Promise(resolve=>settleWaiters.push({token,resolve}));
 }
+function useSeatContactCurve(){return Boolean(seatContactEnabled&&avatar?.getState().footPlacement?.supported);}
 function cancelActions({activityEnding=false}={}){
   actionVersion++;
   if(turning){turning.resolve(false);turning=null;}
   const activeActivity=avatar?.getState().activity;
   if(activeActivity){
-    if(!activeActivity.cancelling)record(activeActivity.name,activityEnding?'completed':'cancelled',activityEnding?'结束这段活动，正在收好东西':'活动被打断，正在收回动作',activityRun?.source||actionOwner||'user');
+    const endingRead=activityEnding&&activeActivity.name==='read';
+    if(!activeActivity.cancelling&&!activeActivity.blocked)record(activeActivity.name,endingRead?'completed':'cancelled',endingRead?'结束这段活动，正在收好东西':'活动被打断，正在收回动作',activityRun?.source||actionOwner||'user');
     const exit=avatar.cancelActivity();activityExit=exit;
     exit.finally(()=>{if(activityExit===exit){activityExit=null;flushSettleWaiters();presence();}});
   }else releasePropLook(activityLookLease);
@@ -153,10 +183,16 @@ function cancelActions({activityEnding=false}={}){
     previous.resolve(false);
     if(!previous.recovery)record('posture','cancelled','姿态过渡被打断了');
     transition=null;
-    if(state.sitBlend>0&&state.sitBlend<1){
-      const to=previous.recovery?previous.to:(state.sitBlend>=.5?1:0);
-      const target=to?seat:places.sofa;
-      transition={...createPostureMotion({from:state.sitBlend,to,fromPosition:avatar.root.position,toPosition:target,fromYaw:avatar.root.rotation.y,recovery:true}),resolve:()=>{}};
+    const position=avatar.root.position;
+    const distance=point=>Math.hypot(position.x-point.x,position.z-point.z);
+    const seatContactCurve=previous.seatContactCurve??useSeatContactCurve();
+    // A folded pose can finish before the body reaches the cushion. Recover
+    // from both observed position and pose, not the blend endpoint alone.
+    const nearerSeat=!seatContactCurve||distance(seat)<=distance(places.sofa);
+    const to=previous.recovery?previous.to:(state.sitBlend>=.5&&nearerSeat?1:0);
+    const target=to?seat:places.sofa;
+    if(Math.abs(state.sitBlend-to)>1e-6||distance(target)>1e-6){
+      transition={...createPostureMotion({from:state.sitBlend,to,fromPosition:position,toPosition:target,fromYaw:avatar.root.rotation.y,recovery:true,seatContactCurve}),resolve:()=>{}};
     }
   }
   gestureWait?.cancel();gestureWait=null;
@@ -168,7 +204,17 @@ function cancelActions({activityEnding=false}={}){
   presence();actionOwner=null;flushSettleWaiters();
 }
 function stopSpeech(){speechVersion++;window.speechSynthesis?.cancel();clearTimeout(speechTimer);avatar?.setSpeaking(false);}
+function renderConnection(connection){
+  providerAvailable=connection.available;
+  const labels={preparing:'连接中…',ready:'Astra','needs-login':'需要登录 Codex',offline:'本地服务未连接','scene-only':'离线场景'};
+  $('#connection-label').textContent=labels[connection.status];
+  $('#connection-dot').className='dot '+(connection.available?'connected':connection.status==='preparing'?'':'error');
+  $('#provider-note').textContent=connection.reason||'使用本机 ChatGPT 订阅。';
+  $('#reconnect').disabled=connection.checking;
+  if(autonomy)renderAutonomyStatus(autonomy.getState());
+}
 function userActivity({conversation=false,listening=false}={}){
+  discardQuietDwellRecovery();
   if(listening)avatar?.setAttention?.('listening');
   lookAt('user');
   stopSpeech();
@@ -181,7 +227,7 @@ function posture(to){
   if((to===1&&state.sitBlend===1)||(to===0&&state.sitBlend===0))return Promise.resolve(true);
   return new Promise(resolve=>{
     const target=to?seat:places.sofa;
-    transition={...createPostureMotion({from:state.sitBlend,to,fromPosition:avatar.root.position,toPosition:target,fromYaw:avatar.root.rotation.y}),resolve};
+    transition={...createPostureMotion({from:state.sitBlend,to,fromPosition:avatar.root.position,toPosition:target,fromYaw:avatar.root.rotation.y,seatContactCurve:useSeatContactCurve()}),resolve};
     state.mode=to?'sitting':'standing_up';state.speed=0;presence();
   });
 }
@@ -189,6 +235,7 @@ function isAtInteractionEdge(){
   return interactionStation&&avatar.root.position.z<TABLE_STAGING_Z-.001;
 }
 async function leaveInteractionStation(token){
+  if(currentCup()?.held)return false;
   if(!interactionStation)return true;
   if(isAtInteractionEdge()){
     const away={x:avatar.root.position.x,z:TABLE_STAGING_Z,label:'茶几前'};
@@ -211,7 +258,8 @@ function turnTo(yaw,token){
   const delta=angleDelta(avatar.root.rotation.y,yaw);
   if(Math.abs(delta)<.005)return Promise.resolve(true);
   return new Promise(resolve=>{
-    turning={from:avatar.root.rotation.y,delta,elapsed:0,duration:Math.max(.25,Math.abs(delta)/3.2),resolve};
+    // Smoothstep's peak speed is 1.5 times its average rotation speed.
+    turning={from:avatar.root.rotation.y,delta,elapsed:0,duration:Math.max(.25,1.5*Math.abs(delta)/(avatar.preferredTurnSpeed??4.8)),resolve};
   });
 }
 function activityState(){
@@ -220,7 +268,7 @@ function activityState(){
   return {id:activityRun?.activityId||actual.id,kind:actual.name,phase:actual.phase,
     cancelling:actual.cancelling,heldObject:actual.holdingProp?'cup':null};
 }
-async function performActivity(name,token,{source='user',activityId}={}){
+async function performActivity(name,token,{source='user',activityId,cupDestination}={}){
   if(!avatar.supportedActivities.includes(name))return false;
   const current=avatar.getState().activity;
   if(name==='read'&&current?.name==='read'&&!current.cancelling)return true;
@@ -235,12 +283,18 @@ async function performActivity(name,token,{source='user',activityId}={}){
   }else if(name==='stretch'){
     if(state.sitBlend>0&&(!await posture(0)||token!==actionVersion))return false;
   }else return false;
-  const handle=avatar.setActivity(name,{props:room.activities,durationSeconds:name==='read'?null:undefined});
+  const handle=avatar.setActivity(name,{props:room.activities,durationSeconds:name==='read'?null:undefined,cupDestination});
   if(!handle){releasePropLook(lookLease);return false;}
   const run={...handle,name,source,activityId:activityId||`manual-${Date.now()}-${++nextActivityId}`};
   activityRun=run;presence();
   if(closeView&&!cameraManuallyAdjusted)switchView(true);
-  handle.finished.then(()=>{
+  handle.finished.then(result=>{
+    if(result.code==='CUP_RETURN_BLOCKED'){
+      toast('杯子还在手里，先停在桌边。');
+      if(token!==actionVersion)record('move_cup','failed','杯子未能安全放回，仍拿在手里',source);
+    }else if(token!==actionVersion&&result.effect?.type==='cup_moved'){
+      record('move_cup','completed',`杯子已放在${cupSpotLabel(result.effect.to)}上`,source);
+    }
     releasePropLook(lookLease);
     if(activityRun===run){activityRun=null;presence();flushSettleWaiters();}
   });
@@ -257,13 +311,17 @@ async function runActions(actions,{replace=true,announce=false,source='user',act
   if(!actions.length&&replace&&!await leaveInteractionStation(token))return {status:'cancelled'};
   for(const action of actions){
     if(token!==actionVersion)return {status:'cancelled'};
+    if(currentCup()?.blocked&&action.type!=='look_at'){
+      record(action.type,'failed','杯子还在手里，先停在桌边');
+      toast('杯子还在手里，先停在桌边。');break;
+    }
     const activeActivity=avatar.getState().activity;
     const continuingRead=action.type==='read'&&activeActivity?.name==='read'&&!activeActivity.cancelling;
     if(activeActivity&&action.type!=='look_at'&&!continuingRead){
       await avatar.cancelActivity();
       if(token!==actionVersion)return {status:'cancelled'};
     }
-    if(!continuingRead&&action.type!=='look_at'&&!['read','drink'].includes(action.type)){
+    if(!continuingRead&&action.type!=='look_at'&&!['read','drink','move_cup'].includes(action.type)){
       if(!await leaveInteractionStation(token))return {status:'cancelled'};
     }
     let ok=true,detail='';
@@ -282,6 +340,14 @@ async function runActions(actions,{replace=true,announce=false,source='user',act
       detail=action.type==='wave'?'挥了挥手':'轻轻点了点头';
     }else if(action.type==='look_at'){
       lookAt(action.target);detail='看向了'+(places[action.target]?.label||'你');
+    }else if(action.type==='move_cup'){
+      const cup=currentCup(),label=cupSpotLabel(action.target);
+      if(!cup?.supported||!label){ok=false;detail='这里暂时不能挪杯子';}
+      else if(cup.spot===action.target&&!cup.held){detail=`杯子已经在${label}上`;}
+      else{
+        ok=await performActivity('move_cup',token,{source,activityId,cupDestination:action.target});
+        detail=ok?`把杯子放到了${label}上`:currentCup()?.blocked?'杯子未能安全放回，仍拿在手里':'杯子没有放到目标杯垫';
+      }
     }else if(['read','drink','stretch'].includes(action.type)){
       ok=await performActivity(action.type,token,{source,activityId});
       const descriptions={read:'在桌边打开书，开始看书',drink:'拿起杯子喝了一口水，并把杯子放回',stretch:'做了一次肩背伸展'};
@@ -296,7 +362,22 @@ async function runActions(actions,{replace=true,announce=false,source='user',act
   return {status:feedback.some(f=>f.id>startFeedback&&f.status==='failed')?'failed':'completed',feedback:feedback.filter(f=>f.id>startFeedback),activity:activityState()};
   }finally{if(token===actionVersion)actionOwner=null;}
 }
-function worldState(){return {position:{x:+avatar.root.position.x.toFixed(2),z:+avatar.root.position.z.toFixed(2)},posture:state.mode,expression:state.expression,location:state.place,gaze:currentLook,activity:activityState(),availableTargets:Object.entries(places).map(([id,p])=>({id,name:p.label,x:p.x,z:p.z})),availableActivities:[...avatar.supportedActivities],avatarModel:avatar.usingFallback?'pixiv 示例角色，普通比例；书杯触达未适配':'本地鲸鱼角色',room:'客厅，有沙发、茶几、窗户、绿植和书柜。可用活动严格以 availableActivities 为准；没有室外移动、做饭或任意拿取物品技能。'};}
+function observedReading(){
+  const context=readingBook.getContext();
+  if(context.activityId){
+    const actual=avatar?.getState().activity;
+    if(actual?.cancelling)context.status='closing';
+    else if(!roomIsActive())context.status='paused';
+  }
+  return context;
+}
+function worldState(){
+  const cup=currentCup();
+  const availableActivities=avatar.supportedActivities.filter(activity=>activity!=='move_cup'||cup?.supported&&!cup.blocked);
+  return {position:{x:+avatar.root.position.x.toFixed(2),z:+avatar.root.position.z.toFixed(2)},posture:state.mode,expression:state.expression,location:state.place,gaze:currentLook,activity:activityState(),reading:observedReading(),
+    ...(cup?.supported?{cup:{...cup,supported:!cup.blocked}}:{}),availableTargets:Object.entries(places).map(([id,p])=>({id,name:p.label,x:p.x,z:p.z})),availableActivities,
+    avatarModel:avatar.usingFallback?'pixiv-sample':'local-whale',room:'客厅，有沙发、茶几、窗户、绿植、书柜和窗边小桌。可用活动以 availableActivities 为准；没有室外移动、做饭或任意拿取物品技能。'};
+}
 function chatWorldState(){
   const world=worldState();
   let clearing=pendingActivityClear;
@@ -335,8 +416,9 @@ async function send(text){
   const controller=new AbortController();activeRequest=controller;setBusy(true);
   const delivery={controller,conversation:requestConversation,entryId:requestEntry.id,interrupted:false};activeDelivery=delivery;
   try{
-    const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history:previous,world:chatWorldState(),feedback,memory:remembered}),signal:controller.signal});
-    const body=await response.json();if(!response.ok)throw new Error(typeof body.error==='string'?body.error:(body.message||'暂时没有连接上 Astra，请稍后再试。'));
+    const payload={message:text,history:previous,world:chatWorldState(),feedback,memory:remembered};
+    const body=await postLocalJson('/api/chat',payload,{signal:controller.signal,fallback:'暂时没有连接上 Astra，请稍后再试。'});
+    if(typeof body.reply!=='string'||!body.reply.trim()||!hasActionList(body.actions))throw invalidLocalResponse();
     if(controller.signal.aborted||activeRequest!==controller)throw new DOMException('回复已取消','AbortError');
     if(!requestConversation.mark(requestEntry.id,'answered'))return;
     if(body.memoryPatch&&(body.memoryPatch.set?.length||body.memoryPatch.forget?.length)){
@@ -346,8 +428,8 @@ async function send(text){
       else if(saved.reason==='full')toast('记忆已满，可以在设置里删掉不再需要的内容。');
       else if(saved.reason==='invalid')toast('回复已收到，但这条记忆没有保存成功。');
     }
-    providerAvailable=true;$('#connection-dot').className='dot connected';$('#connection-label').textContent='Astra';
-    if(body.reply){message('assistant',body.reply);remember('assistant',body.reply);if(autonomy)autonomy.noteSpeech();else pendingSpeech=true;if(!document.hidden)avatar.setAttention?.('responding');}
+    connectionStatus.markSuccess();
+    if(body.reply){message('assistant',body.reply);remember('assistant',body.reply);if(autonomy)autonomy.noteSpeech();else pendingSpeech=true;if(roomIsActive())avatar.setAttention?.('responding');}
     setExpression(document.hidden?'neutral':body.expression||'neutral');speak(body.reply||'');
     void runActions(body.actions||[],{source:'chat'}).then(result=>{
       if(captureChatReadingResult(activityRun,result))adoptChatReading();
@@ -358,16 +440,25 @@ async function send(text){
       if(requestConversation.mark(requestEntry.id,'cancelled'))message('assistant',deliveryLabels.cancelled,'event');
     }else{
       if(requestConversation.mark(requestEntry.id,'failed'))message('assistant',error.message,'error');
-      $('#connection-dot').className='dot error';$('#connection-label').textContent='连接暂时不可用';
+      connectionStatus.markFailure(error);
     }
   }
-  finally{if(activeDelivery===delivery){activeDelivery=null;if(activeRequest===controller)activeRequest=null;setBusy(false);if(!pageLeaving)$('#message-input').focus();}}
+  finally{if(activeDelivery===delivery){activeDelivery=null;if(activeRequest===controller)activeRequest=null;setBusy(false);}}
 }
 memoryControls=installMemoryControls({container:$('.settings-content'),store:memory,
   onMutate:()=>{userActivity();activeRequest?.abort();},onError:toast});
-$('#chat-form').addEventListener('submit',e=>{e.preventDefault();send($('#message-input').value);});
-$('#message-input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send(e.currentTarget.value);}});
-$('#message-input').addEventListener('input',()=>{lastInputAt=Date.now();userActivity({listening:true});});
+const composer=$('#message-input');
+function onDraftChange(){lastInputAt=Date.now();userActivity({listening:true});}
+$('#chat-form').addEventListener('submit',e=>{e.preventDefault();if(!composingMessage)send(composer.value);});
+composer.addEventListener('keydown',e=>{
+  // Some WebKit builds report isComposing=false on the IME commit Enter.
+  if(e.key!=='Enter'||e.shiftKey||e.isComposing||composingMessage||e.keyCode===229)return;
+  e.preventDefault();if(!e.repeat)send(composer.value);
+});
+composer.addEventListener('compositionstart',()=>{composingMessage=true;onDraftChange();});
+composer.addEventListener('compositionend',()=>{composingMessage=false;});
+composer.addEventListener('blur',()=>{composingMessage=false;});
+composer.addEventListener('input',onDraftChange);
 $('#stop').addEventListener('click',async()=>{
   interrupt();const token=actionVersion;
   if(activityExit||brakingMotion||transition)toast('正在停下');
@@ -375,26 +466,48 @@ $('#stop').addEventListener('click',async()=>{
 });
 $('#cancel-reply').addEventListener('click',()=>{userActivity();activeRequest?.abort();});
 $('#voice').addEventListener('change',()=>{if(!$('#voice').checked)stopSpeech();});
+$('#reconnect').addEventListener('click',()=>{void connectionStatus.check();});
 $('#clear-chat').addEventListener('click',()=>{
   interrupt();pendingActivityClear=true;
   try{localStorage.setItem(activityClearKey,crypto.randomUUID());pendingActivityClear=false;}catch{}
   flushActivityClear();
-  conversation.clear();feedback=[];$('#messages').replaceChildren();message('assistant','已清空','event');
+  conversation.clear();bookView=readingBook.reset();room.activities?.setBookSpread(ROOM_BOOK,bookView.pageIndex);
+  $('#book-peek').hidden=true;$('#book-peek').open=false;
+  feedback=[];$('#messages').replaceChildren();message('assistant','已清空','event');
+});
+$('#book-peek').addEventListener('toggle',()=>{
+  if(!$('#book-peek').open||$('#book-peek').hidden)return;
+  const page=ROOM_BOOK.pages[bookView.pageIndex];
+  $('#book-page-title').textContent=`${ROOM_BOOK.title} · ${bookView.pageIndex+1}/${ROOM_BOOK.pages.length} · ${page.title}`;
+  $('#book-page-text').textContent=page.text;
 });
 for(const b of document.querySelectorAll('[data-prompt]'))b.addEventListener('click',()=>send(b.dataset.prompt));
 for(const b of document.querySelectorAll('[data-expression]'))b.addEventListener('click',()=>{userActivity();setExpression(b.dataset.expression,{source:'manual'});});
-for(const b of document.querySelectorAll('[data-action]'))b.addEventListener('click',()=>{
+function runManualAction(type){
+  if(!initialized)return;
   $('.activity-picker').open=false;
-  const type=b.dataset.action;
-  if(['sit','stand'].includes(type)&&manualAction?.type===type&&actionOwner==='user')return;
+  if(['read','drink','stretch'].includes(type)&&!avatar.supportedActivities.includes(type)){toast('当前角色还没适配这个动作。');return;}
+  if(manualAction?.type===type&&actionOwner==='user')return;
   if(type==='read'&&activityRun?.source==='user'&&avatar?.getState().activity?.name==='read'&&!avatar.getState().activity.cancelling)return;
   userActivity();activeRequest?.abort();stopSpeech();
   const run={type};manualAction=run;
   runActions([{type:type==='window'?'move_to':type,target:type==='window'?'window':type==='sit'?'sofa':'none'}]).finally(()=>{if(manualAction===run)manualAction=null;});
-});
+}
+for(const b of document.querySelectorAll('[data-action]'))b.addEventListener('click',()=>runManualAction(b.dataset.action));
 function closeAnchor(){
   const eyeHeight=avatar.eyeHeight ?? avatar.headHeight ?? 1.2;
-  return avatar.root.position.clone().add(new THREE.Vector3(0,eyeHeight-.12-avatar.sitDrop*state.sitBlend,0));
+  return avatar.root.position.clone().add(new THREE.Vector3(0,eyeHeight-.12-avatar.sitDrop*state.sitBlend+(avatar.groundOffset??0),0));
+}
+function projectSceneCamera(dt){
+  if(closeView){
+    const orbit=constrainRoomCamera(orbitCamera.position,controls.target);
+    orbitCamera.position.set(orbit.x,orbit.y,orbit.z);orbitCamera.lookAt(controls.target);
+    // The look-at point can cross furniture while the view reframes. Protect
+    // the real character, not that temporary point in the middle of a sofa.
+    cameraAvoidance=resolveCameraOcclusion(orbit,followAnchor,room.cameraObstacles,{previous:cameraAvoidance,deltaSeconds:dt,minimumFramingDistance});
+    const safe=cameraAvoidance.position;camera.position.set(safe.x,safe.y,safe.z);
+  }else{cameraAvoidance=null;camera.position.copy(orbitCamera.position);}
+  camera.lookAt(controls.target);camera.updateMatrixWorld();
 }
 function switchView(close){
   if(!avatar)return;
@@ -402,7 +515,7 @@ function switchView(close){
   const target=close?closeAnchor():new THREE.Vector3(-.15,.75,-.2);
   const offset=new THREE.Vector3(.72,.32,2.45).applyAxisAngle(new THREE.Vector3(0,1,0),avatar.root.rotation.y);
   const position=close?target.clone().add(offset):new THREE.Vector3(7.2,5.2,9.7);
-  cameraTween={from:camera.position.clone(),to:position,fromTarget:controls.target.clone(),toTarget:target,time:0,orbit:close};
+  cameraTween={from:(close?orbitCamera:camera).position.clone(),to:position,fromTarget:controls.target.clone(),toTarget:target,time:0,orbit:close};
   cameraTween.duration=.85;
   if(close){
     let previous=sampleCameraOrbit(cameraTween,0),distance=0,rotation=0;
@@ -418,16 +531,18 @@ function switchView(close){
   // Do not leave a camera-button change waiting on a throttled animation clock.
   if(inspectionPaused||!renderPresence.getState().active){
     const view=close?sampleCameraOrbit(cameraTween,1):{position:cameraTween.to,target:cameraTween.toTarget};
-    camera.position.set(view.position.x,view.position.y,view.position.z);
+    orbitCamera.position.set(view.position.x,view.position.y,view.position.z);
     controls.target.set(view.target.x,view.target.y,view.target.z);
-    camera.lookAt(controls.target);cameraTween=null;renderer.render(scene,camera);
+    cameraTween=null;cameraAvoidance=null;projectSceneCamera(0);renderer.render(scene,camera);
   }
-  $('#view-close').classList.toggle('active',close);$('#view-room').classList.toggle('active',!close);
+  for(const [id,active] of [['#view-close',close],['#view-room',!close]]){
+    $(id).classList.toggle('active',active);$(id).setAttribute('aria-pressed',String(active));
+  }
 }
 $('#view-room').addEventListener('click',()=>switchView(false));$('#view-close').addEventListener('click',()=>switchView(true));
 for(const b of document.querySelectorAll('[data-expression]'))b.addEventListener('click',()=>{$('.expression-picker').open=false;});
-document.addEventListener('pointerdown',event=>{for(const menu of document.querySelectorAll('.settings,.expression-picker,.activity-picker,.room-help'))if(!menu.contains(event.target))menu.open=false;});
-document.addEventListener('keydown',event=>{if(event.key==='Escape')document.querySelectorAll('.settings,.expression-picker,.activity-picker,.room-help').forEach(menu=>menu.open=false);});
+document.addEventListener('pointerdown',event=>{for(const menu of document.querySelectorAll('.settings,.expression-picker,.activity-picker,.room-help,.book-peek'))if(!menu.contains(event.target))menu.open=false;});
+document.addEventListener('keydown',event=>{if(event.key==='Escape')document.querySelectorAll('.settings,.expression-picker,.activity-picker,.room-help,.book-peek').forEach(menu=>menu.open=false);});
 function fitSettings(){
   const menu=$('.settings'),panel=$('.settings-content');
   if(!menu.open)return;
@@ -447,35 +562,67 @@ window.addEventListener('scroll',fitSettings,{passive:true});
 window.visualViewport?.addEventListener('resize',fitSettings);
 
 let pointerDown=null;
-renderer.domElement.addEventListener('pointerdown',e=>{pointerDown={x:e.clientX,y:e.clientY,time:performance.now()};cameraTween=null;});
-renderer.domElement.addEventListener('pointermove',e=>{if(pointerDown&&e.buttons&&Math.hypot(e.clientX-pointerDown.x,e.clientY-pointerDown.y)>6)cameraManuallyAdjusted=true;});
+const pointerDistance=(e,start)=>Math.hypot(e.clientX-start.x,e.clientY-start.y);
+renderer.domElement.addEventListener('pointerdown',e=>{
+  if(!e.isPrimary){pointerDown=null;cameraManuallyAdjusted=true;return;}
+  if(e.button!==0){pointerDown=null;return;}
+  pointerDown={id:e.pointerId,x:e.clientX,y:e.clientY,time:performance.now()};cameraTween=null;
+});
+renderer.domElement.addEventListener('pointermove',e=>{
+  if(pointerDown?.id===e.pointerId&&pointerDistance(e,pointerDown)>6){pointerDown=null;cameraManuallyAdjusted=true;}
+});
+for(const type of ['pointercancel','lostpointercapture'])renderer.domElement.addEventListener(type,e=>{if(pointerDown?.id===e.pointerId)pointerDown=null;});
 renderer.domElement.addEventListener('wheel',()=>{cameraManuallyAdjusted=true;cameraTween=null;},{passive:true});
 renderer.domElement.addEventListener('pointerup',e=>{
-  if(!avatar||!pointerDown||Math.hypot(e.clientX-pointerDown.x,e.clientY-pointerDown.y)>6||performance.now()-pointerDown.time>500)return;
+  if(pointerDown?.id!==e.pointerId)return;
+  const start=pointerDown;pointerDown=null;
+  if(!initialized||e.button!==0||pointerDistance(e,start)>6||performance.now()-start.time>500)return;
   const rect=renderer.domElement.getBoundingClientRect(),mouse=new THREE.Vector2((e.clientX-rect.left)/rect.width*2-1,-(e.clientY-rect.top)/rect.height*2+1);
-  const ray=new THREE.Raycaster();ray.setFromCamera(mouse,camera);const hits=ray.intersectObject(ground);if(!hits.length)return;
-  const point={x:hits[0].point.x,z:hits[0].point.z};
-  if(!isWalkable(point)){toast('这里放着家具，请选一处空地。');return;}
-  userActivity();activeRequest?.abort();runActions([{type:'move_to',point}]);
+  const ray=new THREE.Raycaster();ray.setFromCamera(mouse,camera);const hit=room.pick(ray,avatar.root);
+  if(!hit)return;
+  if(hit.kind==='action'){runManualAction(hit.action);return;}
+  if(hit.kind==='blocked'||!isWalkable(hit.point)){toast('这里放着家具，请选一处空地。');return;}
+  userActivity();activeRequest?.abort();stopSpeech();runActions([{type:'move_to',point:hit.point}]);
 });
 let elapsed=0;
 function frame(now){
   requestAnimationFrame(frame);
+  if(document.hidden||pageLifecycle.isBlocked())return;
+  // The opt-in inspection probe sparsifies this loop's real RAF input. The
+  // watchdog still runs normally; no clock or browser lifecycle event is faked.
+  if(frameProbeLastAt!==null){
+    if(now-frameProbeLastAt<1000)return;
+    frameProbeLastAt=now;
+  }
   const presence=renderPresence.frame(now);
   // All local animation and completion checks share the visible animation clock.
-  if(document.hidden||inspectionPaused)return;
+  if(inspectionPaused)return;
   // Keep a still image after loading/resizing even if this embedded browser
   // throttles RAF without reporting document.hidden. Do not advance the body.
   if(!presence.active){renderer.render(scene,camera);return;}
-  advanceFrame(presence.deltaSeconds);
+  advanceFrame(presence.deltaSeconds,{realFrame:true});
 }
-function advanceFrame(dt){
+function observeBook(actual,dt,realFrame){
+  const reading=actual.activity?.name==='read'?actual.activity:null;
+  if(!reading&&bookView.activityId===null)return;
+  const prop=room.activities?.getState();
+  const next=readingBook.observe({activityId:reading?(activityRun?.activityId??reading.id):null,
+    phase:reading?.phase,cancelling:reading?.cancelling,bookOpen:prop?.bookOpen,pageFlip:prop?.pageFlip,
+    deltaSeconds:dt,renderActive:realFrame,realFrame,lookingAtBook:currentLook==='book'});
+  if(next.pageIndex!==bookView.pageIndex)room.activities?.setBookSpread(ROOM_BOOK,next.pageIndex);
+  bookView=next;
+  const show=Boolean(reading&&!reading.cancelling&&prop?.bookOpen>.95&&['reading','turning-page'].includes(reading.phase));
+  const peek=$('#book-peek');
+  if(peek.hidden===show)peek.hidden=!show;
+  if(!show&&peek.open)peek.open=false;
+}
+function advanceFrame(dt,{realFrame=false}={}){
   elapsed+=dt;
   if(avatar){
     let animationSpeed=0,walkDirection=1;
     const route=movement||brakingMotion;
     if(route){
-      const step=stepRoute({position:avatar.root.position,path:route.path,index:route.index,yaw:avatar.root.rotation.y,speed:state.speed},dt,{maxSpeed:route.maxSpeed??avatar.preferredWalkSpeed??.45,facingYaw:route.facingYaw,stopping:!movement});
+      const step=stepRoute({position:avatar.root.position,path:route.path,index:route.index,yaw:avatar.root.rotation.y,speed:state.speed},dt,{maxSpeed:route.maxSpeed??avatar.preferredWalkSpeed??.45,turnSpeed:avatar.preferredTurnSpeed??3.8,facingYaw:route.facingYaw,stopping:!movement});
       if(dt>0)animationSpeed=Math.hypot(step.position.x-avatar.root.position.x,step.position.z-avatar.root.position.z)/dt;
       if(Number.isFinite(route.facingYaw)){
         const along=(step.position.x-avatar.root.position.x)*Math.sin(step.yaw)+(step.position.z-avatar.root.position.z)*Math.cos(step.yaw);
@@ -496,7 +643,11 @@ function advanceFrame(dt){
         if(Math.hypot(dx,dz)>.05){
           const delta=angleDelta(avatar.root.rotation.y,Math.atan2(dx,dz));
           // Small glances belong to the eyes/head; turn the body only when needed.
-          if(Math.abs(delta)>.32)avatar.root.rotation.y+=(delta-Math.sign(delta)*.16)*(1-Math.exp(-2.8*dt));
+          if(Math.abs(delta)>.32){
+            const turn=(delta-Math.sign(delta)*.16)*(1-Math.exp(-2.8*dt));
+            const cap=(avatar.preferredTurnSpeed??Infinity)*dt;
+            avatar.root.rotation.y+=dt>0?THREE.MathUtils.clamp(turn,-cap,cap):0;
+          }
         }
       }
     }
@@ -514,7 +665,7 @@ function advanceFrame(dt){
       avatar.root.rotation.y=motion.from+motion.delta*blend;
       if(t>=1){turning=null;motion.resolve(true);}
     }
-    let lookTarget=gazeTargets[currentLook]||camera.position;
+    let lookTarget=(currentLook==='cup'?room.activities?.lookTargets?.cup:null)||gazeTargets[currentLook]||camera.position;
     if(movement||brakingMotion){
       const route=movement||brakingMotion,p=route.path[Math.min(route.index,route.path.length-1)];
       const dx=p.x-avatar.root.position.x,dz=p.z-avatar.root.position.z,distance=Math.hypot(dx,dz);
@@ -522,8 +673,10 @@ function advanceFrame(dt){
       const fixed=Number.isFinite(route.facingYaw);
       lookTarget=new THREE.Vector3(avatar.root.position.x+(fixed?Math.sin(route.facingYaw):distance>.01?dx/distance:Math.sin(avatar.root.rotation.y))*1.5,eyeHeight+.02,avatar.root.position.z+(fixed?Math.cos(route.facingYaw):distance>.01?dz/distance:Math.cos(avatar.root.rotation.y))*1.5);
     }
-    avatar.update(dt,{time:elapsed,speed:animationSpeed,walkDirection,seated:state.mode==='seated',sitBlend:state.sitBlend,lookTarget});
+    const pageTurnAllowed=currentLook==='book'&&bookView.pageIndex<ROOM_BOOK.pages.length-1&&bookView.readPageIds.includes(bookView.pageId);
+    avatar.update(dt,{time:elapsed,speed:animationSpeed,walkDirection,seated:state.mode==='seated',sitBlend:state.sitBlend,lookTarget,pageTurnAllowed,readAlongPage:readAlongPage&&currentLook==='book',groundHeightAt:room.groundHeightAt,attentionCueEnabled,renderVisible:realFrame});
     const actual=avatar.getState();
+    observeBook(actual,dt,realFrame);
     if(actual.activity||activityRun)presence();
     if(activityRun?.source==='chat')adoptChatReading();
     gestureWait?.update(actual.gesture,true);
@@ -537,32 +690,39 @@ function advanceFrame(dt){
   if(closeView&&avatar){
     const anchor=closeAnchor(),delta=anchor.clone().sub(followAnchor);
     if(cameraTween){for(const key of ['from','to','fromTarget','toTarget'])cameraTween[key].add(delta);}
-    else{camera.position.add(delta);controls.target.add(delta);}
+    else{
+      orbitCamera.position.add(delta);controls.target.add(delta);
+      // A drag or wheel event can interrupt the transition into close view.
+      // Finish centering gently without undoing the user's chosen angle.
+      const correction=anchor.clone().sub(controls.target).multiplyScalar(1-Math.exp(-6*dt));
+      if(correction.lengthSq()>(4*dt)**2)correction.setLength(4*dt);
+      orbitCamera.position.add(correction);controls.target.add(correction);
+    }
     followAnchor.copy(anchor);
   }
   if(cameraTween){
     const tw=cameraTween;tw.time+=dt;const t=Math.min(1,tw.time/tw.duration),s=t*t*(3-2*t);
-    if(tw.orbit){const view=sampleCameraOrbit(tw,s);camera.position.set(view.position.x,view.position.y,view.position.z);controls.target.set(view.target.x,view.target.y,view.target.z);}
-    else{camera.position.lerpVectors(tw.from,tw.to,s);controls.target.lerpVectors(tw.fromTarget,tw.toTarget,s);}
+    if(tw.orbit){const view=sampleCameraOrbit(tw,s);orbitCamera.position.set(view.position.x,view.position.y,view.position.z);controls.target.set(view.target.x,view.target.y,view.target.z);}
+    else{orbitCamera.position.lerpVectors(tw.from,tw.to,s);controls.target.lerpVectors(tw.fromTarget,tw.toTarget,s);}
     if(t>=1)cameraTween=null;
   }
   controls.update();
-  if(closeView){
-    const safe=constrainRoomCamera(camera.position,controls.target);
-    camera.position.set(safe.x,safe.y,safe.z);camera.lookAt(controls.target);
-  }
+  projectSceneCamera(dt);
   renderer.render(scene,camera);
 }
 requestAnimationFrame(frame);
 function renderAutonomyStatus(value){
   const labels={off:'已关闭',waiting:'待机',thinking:'思考中',acting:'活动中',resting:'休息中',paused:'已暂停',other:'另一页在活动',error:'暂不可用'};
-  $('#autonomy-status').textContent=labels[value.status]||'待机';
+  const noConnection=value.enabled&&!providerAvailable&&['waiting','resting'].includes(value.status);
+  const sceneOnly=connectionStatus.getState().status==='scene-only';
+  $('#autonomy-status').textContent=noConnection?(sceneOnly?'离线场景':'连接未就绪'):labels[value.status]||'待机';
   $('#autonomy-status').title=value.activity||'';
-  $('#autonomy-reason').textContent=value.status==='off'?'自主活动已关闭。':[value.activity,value.reason].filter(Boolean).join(' · ')||'暂无活动。';
+  $('#autonomy-reason').textContent=noConnection?(sceneOnly?'可以继续手动操作。':'请在设置里重连。'):value.status==='off'?'自主活动已关闭。':[value.activity,value.reason].filter(Boolean).join(' · ')||'暂无活动。';
   $('#autonomy-dot').dataset.state=value.status;
-  $('#autonomy-now').disabled=!value.enabled||!autonomy||['thinking','acting'].includes(value.status)||busy||!initialized;
+  $('#autonomy-now').disabled=!value.enabled||!autonomy||['thinking','acting'].includes(value.status)||busy||!initialized||!providerAvailable;
 }
-function isTyping(){return Boolean($('#message-input').value.trim())||Date.now()-lastInputAt<5000;}
+function isTyping(){return composingMessage||Boolean(composer.value.trim())||Date.now()-lastInputAt<5000;}
+function discardQuietDwellRecovery(){quietDwellFrameGap=false;quietDwellRecovery=null;}
 function adoptChatReading(){
   return tryAdoptChatReading({
     run:activityRun,actual:avatar?.getState().activity,autonomy,
@@ -571,22 +731,27 @@ function adoptChatReading(){
   });
 }
 function startOwnedAutonomy(){
+  const recovery=quietDwellRecovery;discardQuietDwellRecovery();
   const owned=createAutonomyController({
     initialEnabled:true,
     journal:activityJournal,
-    getSnapshot:()=>({
-      ready:initialized&&providerAvailable,
-      idle:!movement&&!brakingMotion&&!transition&&!turning&&!activityExit&&!actionOwner&&(!activityRun||activityRun.source==='autonomy'),
-      visible:roomIsActive(),renderActive:renderPresence.getState().active,
-      typing:isTyping(),
-      chatBusy:busy,
-      history:conversation.modelHistory(),world:avatar?worldState():{},feedback:[...feedback],
-      memory:memory.snapshot(),canSpeak:proactivePreference(memory.snapshot())!=='quiet',
-    }),
+    allowNextIntent,
+    quietDwellRecovery:recovery,
+    getSnapshot:()=>{
+      const remembered=memory.snapshot();
+      return {
+        ready:initialized&&providerAvailable,
+        idle:!movement&&!brakingMotion&&!transition&&!turning&&!activityExit&&!actionOwner&&!currentCup()?.blocked&&(!activityRun||activityRun.source==='autonomy'),
+        visible:roomIsActive(),renderActive:renderPresence.getState().active,
+        typing:isTyping(),chatBusy:busy,
+        history:conversation.modelHistory(),world:avatar?worldState():{},feedback:[...feedback],
+        memory:remembered,canSpeak:proactivePreference(remembered)!=='quiet',
+      };
+    },
     onStatus:value=>{if(autonomy===owned)renderAutonomyStatus(value);},
-    onError:error=>{ $('#autonomy-reason').textContent=error.message||'连接失败，请稍后重试。'; },
+    onError:error=>{connectionStatus.markFailure(error);$('#autonomy-reason').textContent=error.message||'连接失败，请稍后重试。';},
     onPlan:async plan=>{
-      setExpression(plan.expression);
+      if(plan.executionSource!=='planned-next')setExpression(plan.expression);
       if(plan.reply){message('assistant',plan.reply,'proactive');remember('assistant',plan.reply);avatar.setAttention?.('responding');speak(plan.reply);}
       if(plan.continuationOf&&plan.actions.length===0)return {status:'completed',feedback:[],activity:activityState()};
       return await runActions(plan.actions,{source:'autonomy',activityId:plan.activityId,replace:!plan.continuationOf});
@@ -601,7 +766,11 @@ function startOwnedAutonomy(){
   return ()=>{
     if(autonomy===owned){
       if(actionOwner==='autonomy'||activityRun?.source==='autonomy')cancelActions();
-      stopSpeech();owned.dispose();autonomy=null;
+      stopSpeech();
+      const preserve=quietDwellFrameGap&&!document.hidden&&!pageLifecycle.isBlocked()&&!pageLeaving&&!inspectionPaused&&autonomyEnabled;
+      quietDwellFrameGap=false;
+      quietDwellRecovery=owned.dispose({preserveQuietDwell:preserve})||null;
+      autonomy=null;
     }else owned.dispose();
   };
 }
@@ -610,6 +779,7 @@ function flushActivityClear(){
   let request;
   try{request=localStorage.getItem(activityClearKey);}catch{}
   if(!request&&!pendingActivityClear)return;
+  discardQuietDwellRecovery();
   if(actionOwner==='autonomy'||activityRun?.source==='autonomy'){cancelActions();stopSpeech();}
   autonomy.clearMemory();pendingActivityClear=false;
   try{if(localStorage.getItem(activityClearKey)===request)localStorage.removeItem(activityClearKey);}catch{}
@@ -634,13 +804,14 @@ function setupAutonomy(){
 $('#autonomy-enabled').addEventListener('change',()=>{
   autonomyEnabled=$('#autonomy-enabled').checked;
   try{localStorage.setItem(autonomyStoreKey,String(autonomyEnabled));}catch{}
-  if(!autonomyEnabled){if(actionOwner==='autonomy'||activityRun?.source==='autonomy')cancelActions();stopSpeech();}
+  if(!autonomyEnabled){discardQuietDwellRecovery();if(actionOwner==='autonomy'||activityRun?.source==='autonomy')cancelActions();stopSpeech();}
   refreshAutonomyOwnership();
 });
 window.addEventListener('storage',event=>{
-  if(event.key===activityClearKey){if(event.newValue)flushActivityClear();return;}
+  if(event.key===activityClearKey){if(event.newValue){discardQuietDwellRecovery();flushActivityClear();}return;}
   if(event.key!==autonomyStoreKey)return;
   autonomyEnabled=event.newValue!=='false';$('#autonomy-enabled').checked=autonomyEnabled;
+  if(!autonomyEnabled)discardQuietDwellRecovery();
   refreshAutonomyOwnership();
 });
 $('#autonomy-now').addEventListener('click',async()=>{
@@ -652,14 +823,8 @@ $('#autonomy-now').addEventListener('click',async()=>{
   const result=autonomy?.requestNow();
   if(result&&!result.ok)toast(result.reason||'当前活动尚未结束。');
 });
-document.addEventListener('visibilitychange',()=>{
-  if(document.hidden){
-    stopSpeech();
-    avatar?.setExpression('neutral');avatar?.setAttention?.('idle');
-  }else{if(busy)avatar?.setAttention?.('thinking');}
-  refreshAutonomyOwnership();
-});
-window.addEventListener('pagehide',event=>{
+function releasePageConversation(){
+  if(pageLeaving)return;
   pageLeaving=true;conversationReady=false;conversationEpoch++;
   if(activeDelivery){
     activeDelivery.interrupted=true;
@@ -669,28 +834,39 @@ window.addEventListener('pagehide',event=>{
   activeRequest?.abort();activeRequest=null;setBusy(false);
   const scope=conversationScope;conversationScope=null;
   conversationRelease=Promise.all([conversationOpening,scope?.dispose()]);
-  if(event.persisted)autonomyOwner?.setEnabled(false);else void autonomyOwner?.dispose();
-});
-window.addEventListener('pageshow',async event=>{
-  if(event.persisted){pageLeaving=false;await openConversation();refreshAutonomyOwnership();}
-});
+}
+function handlePageLifecycle({state:next,previous,type}){
+  if(next.blocked)discardQuietDwellRecovery();
+  if(next.blocked&&!previous.blocked){
+    renderPresence.invalidate(type);
+    stopSpeech();setExpression('neutral');avatar?.setAttention?.('idle');
+  }
+  if(next.frozen||next.inHistory||next.departed)releasePageConversation();
+  if(next.departed){connectionStatus.dispose();void autonomyOwner?.dispose();return;}
+  if(!next.blocked&&pageLeaving){
+    pageLeaving=false;
+    void openConversation().then(refreshAutonomyOwnership);
+  }
+  if(previous.blocked&&!next.blocked&&!providerAvailable)void connectionStatus.check();
+  refreshAutonomyOwnership();
+}
+function observePageEvent(event){pageLifecycle.handle(event.type,{hidden:document.hidden,persisted:event.persisted});}
+for(const type of ['visibilitychange','freeze','resume'])document.addEventListener(type,observePageEvent);
+for(const type of ['pagehide','pageshow'])window.addEventListener(type,observePageEvent);
 async function init(){
   $('#send').disabled=true;
   const conversationPromise=openConversation();
-  const statusPromise=fetch('/api/status').then(r=>r.json()).then(status=>{
-    providerAvailable=status.available;
-    $('#connection-dot').className='dot '+(status.available?'connected':'error');
-    $('#connection-label').textContent=status.available?'Astra':status.offline?'离线场景':'需要登录 Codex';
-    if(!status.available){$('#provider-note').textContent=status.reason||'请在终端运行 codex login 登录 ChatGPT';}
-  }).catch(()=>{$('#connection-label').textContent='本地服务未连接';});
+  const statusPromise=connectionStatus.check();
   try{
-    avatar=await createAvatar(scene);
-    $('#avatar-note').textContent=avatar.usingFallback?'当前为 pixiv 示例角色；看书和喝水需要本地适配模型。':'当前为本地鲸鱼角色；该模型未随公开仓库分发。';
+    avatar=await createAvatar(scene,{tailGround});
+    if(cupShift&&avatar.cupTransferSupported)room.activities?.enableCupTransfer?.();
+    if(avatar.usingFallback){
+      $('#avatar-note').hidden=false;$('#avatar-source').href='/assets/ATTRIBUTION-pixiv.txt';$('#avatar-author').textContent='pixiv';
+    }
     for(const button of document.querySelectorAll('[data-action="read"], [data-action="drink"], [data-action="stretch"]')){
       button.disabled=!avatar.supportedActivities.includes(button.dataset.action);
-      if(button.disabled)button.title='当前模型尚未适配此活动';
+      if(button.disabled)button.title='当前角色还没适配这个动作';
     }
-    if(avatar.usingFallback)toast('已加载公开的 pixiv 示例角色');
     await conversationPromise;
     // Keep the chibi's short thighs on the cushion, with knees past its front.
     seat.z=-1.60-(avatar.thighLength ?? .37);
@@ -698,8 +874,11 @@ async function init(){
     initialized=true;$('#loading').hidden=true;$('#send').disabled=!conversationReady;presence();
     installDiagnostics({avatar,renderer,scene,camera,getWorldState:worldState,getAutonomyState:()=>autonomy?.getState(),getFeedback:()=>feedback,
       getSimulationTime:()=>elapsed,
+      getCameraAvoidance:()=>cameraAvoidance,
       getRenderPresence:()=>renderPresence.getState(),
-      setPaused:value=>{inspectionPaused=value;refreshAutonomyOwnership();},
+      getPageLifecycle:()=>pageLifecycle.getState(),
+      setFrameProbe:frameProbeEnabled?value=>{frameProbeLastAt=value?performance.now():null;}:null,
+      setPaused:value=>{inspectionPaused=value;if(value){discardQuietDwellRecovery();stopSpeech();avatar.setAttention?.('idle');}refreshAutonomyOwnership();},
       step:async seconds=>{if(!inspectionPaused)return;for(let left=seconds;left>1e-6;left-=1/60){advanceFrame(Math.min(left,1/60));await Promise.resolve();}},
     });
     // Read-only diagnostics for local rendering acceptance; no privileged controls.

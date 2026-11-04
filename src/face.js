@@ -23,6 +23,8 @@ export function createFaceController({ random = Math.random } = {}) {
   let hold = 0;
   let attention = 'idle';
   let attentionUntil = Infinity;
+  let responseCueStart = -Infinity;
+  let responseCueCancelled = true;
   let speaking = false;
   let speechBlend = 0;
   let nextBlink = 1.8 + random() * 1.6;
@@ -46,17 +48,33 @@ export function createFaceController({ random = Math.random } = {}) {
     return true;
   }
 
-  function setAttention(value = 'idle') {
+  function setAttention(value = 'idle', { allowResponseCue = true } = {}) {
     if (!['idle', 'listening', 'thinking', 'responding'].includes(value)) return false;
+    if (attention !== value) {
+      responseCueStart = value === 'responding' && allowResponseCue ? time : -Infinity;
+      responseCueCancelled = value !== 'responding' || !allowResponseCue;
+    }
+    if (!allowResponseCue || value !== 'responding') responseCueCancelled = true;
     attention = value;
     attentionUntil = value === 'listening' ? time + 3 : value === 'responding' ? time + 4 : Infinity;
     if (value === 'listening' || value === 'thinking') setExpression('neutral');
     return true;
   }
 
-  function update(rawDt, { moving = false } = {}) {
+  function responseCueActive() {
+    return attention === 'responding' && !responseCueCancelled && time - responseCueStart < 1.1;
+  }
+
+  function responseCuePitch() {
+    return responseCueActive() ? .055 * Math.sin(Math.PI * clamp((time - responseCueStart) / 1.1, 0, 1)) ** 2 : 0;
+  }
+
+  function update(rawDt, { moving = false, responseCueAllowed = true } = {}) {
     const dt = clamp(Number(rawDt) || 0, 0, 0.1);
     time += dt;
+    // A blocked entry is consumed, not queued for the next idle moment. This
+    // also works with dt=0 when the page becomes hidden or inspection disables it.
+    if (moving || !responseCueAllowed) responseCueCancelled = true;
     if (time >= attentionUntil) { attention = 'idle'; attentionUntil = Infinity; }
     const age = time - expressionStart;
     const release = expression === 'surprised' ? 1 : 2.2;
@@ -110,6 +128,7 @@ export function createFaceController({ random = Math.random } = {}) {
     }
     lastFrame = {
       channels, blink: blink * 0.98, gazeYaw, gazePitch,
+      responseCuePitch: responseCuePitch(),
       headTilt: attention === 'listening' ? -0.018 : attention === 'thinking' ? 0.025 : 0,
       vowels: {
         aa: speechBlend * (0.06 + 0.22 * Math.max(0, Math.sin(time * 18))),
@@ -123,8 +142,11 @@ export function createFaceController({ random = Math.random } = {}) {
 
   return {
     setExpression, setAttention, update,
+    cancelResponseCue() { responseCueCancelled = true; },
     setSpeaking(value) { speaking = Boolean(value); },
     reset() { setExpression('neutral'); setAttention('idle'); speaking = false; },
-    getState() { return { expression, attention, speaking, blink: blink * 0.98, reactionAge: time - expressionStart, channels: { ...lastFrame?.channels } }; },
+    getState() { return { expression, attention, speaking, blink: blink * 0.98, reactionAge: time - expressionStart,
+      responseCueActive: responseCueActive(), responseCuePitch: responseCuePitch(),
+      channels: { ...lastFrame?.channels } }; },
   };
 }

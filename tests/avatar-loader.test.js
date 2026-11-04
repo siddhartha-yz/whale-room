@@ -33,13 +33,18 @@ test('bundled pixiv skeleton supports finite basic poses without the private wha
     return loadLocalVrmFixture(new URL('../public/assets/avatar.vrm', import.meta.url));
   };
   t.after(() => { GLTFLoader.prototype.loadAsync = original; });
-  const scene = new THREE.Scene(), avatar = await createAvatar(scene);
+  const scene = new THREE.Scene(), avatar = await createAvatar(scene, { tailGround: true });
   t.after(() => avatar.dispose());
   assert.equal(avatar.usingFallback, true);
   assert.equal(avatar.modelSource, PUBLIC_AVATAR_URL);
   assert.deepEqual(avatar.supportedActivities, ['stretch']);
+  assert.equal(avatar.cupTransferSupported, false);
+  assert.equal(avatar.getState().footPlacement.supported, false);
+  assert.equal(avatar.getState().tailGround.enabled, false);
+  assert.equal(scene.getObjectByName('CompanionTailGround'), undefined);
   assert.equal(avatar.setActivity('read'), null);
   assert.equal(avatar.setActivity('drink'), null);
+  assert.equal(avatar.setActivity('move_cup'), null);
   const initialHead = avatar.vrm.humanoid.getRawBoneNode('head').getWorldPosition(new THREE.Vector3());
   const target = new THREE.Vector3(0, avatar.eyeHeight, 2);
   for (const expression of avatar.expressions) {

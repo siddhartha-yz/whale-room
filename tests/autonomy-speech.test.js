@@ -23,7 +23,7 @@ test('an explicit invitation affects the prompt only when the effective preferen
     { memory: allowed, canSpeak: true, requestedChange: false, invited: true },
     { memory: { ...allowed, entries: [earlierQuiet, ...allowed.entries] }, canSpeak: true, invited: true },
     { memory: allowed, canSpeak: false, invited: false },
-    { memory: allowed, canSpeak: true, requestedChange: true, invited: false },
+    { memory: allowed, canSpeak: true, requestedChange: true, invited: false, effectiveGate: false },
     { memory: { ...allowed, entries: [...allowed.entries, newerQuiet] }, canSpeak: true, invited: false, effectiveGate: false },
     { memory: { revision: '0', entries: [] }, canSpeak: true, invited: false },
   ];
@@ -37,6 +37,8 @@ test('an explicit invitation affects the prompt only when the effective preferen
     assert.equal(validateAutonomyReply({ ...silentPlan, reply: '一个具体的小念头。' }, input.autonomy).reply,
       effectiveGate ? '一个具体的小念头。' : '', 'quiet and cooldown restrictions remain enforced in output validation');
   }
+  assert.equal(validateAutonomyReply({ ...silentPlan, reply: '临时主动发言。' }, { canSpeak: true, requestedChange: true }).reply, '',
+    'an injected caller cannot turn a manual activity change into a speaking opportunity');
 });
 
 test('chat-started continuous reading reopens speech after three minutes; silence does not consume the single remark', async t => {

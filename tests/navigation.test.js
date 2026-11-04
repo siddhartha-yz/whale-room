@@ -65,6 +65,9 @@ test('invalid targets, furniture interiors and body-clearance areas are rejected
     { x: 3.66, z: 2 }, { x: -3.66, z: 2 }, { x: 0, z: 2.86 },
     { x: 0, z: -2.86 }, { x: 0, z: 0.5 }, { x: 0, z: 1.1 },
     { x: -0.85, z: -2.1 }, { x: 3.1, z: -2.4 }, { x: 3.2, z: 0 },
+    { x: -2.96, z: -2.08 }, // previously allowed a click through the side table
+    { x: 2.65, z: -0.6 }, // root clears the cabinet, but the large head can still overlap it
+    { x: -3.58, z: -0.5 }, // near the inner wall; the named window approach remains reachable
   ];
   for (const end of invalid) {
     assert.equal(isWalkable(end), false);

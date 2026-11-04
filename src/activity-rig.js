@@ -6,8 +6,24 @@ const mix = (a, b, t) => a + (b - a) * t;
 const vector = (a, b, t) => a.map((value, i) => mix(value, b[i], t));
 const interval = (time, start, end) => ease((time - start) / (end - start));
 
-export const ACTIVITY_NAMES = Object.freeze(['read', 'drink', 'stretch']);
-export const ACTIVITY_TIMING = Object.freeze({ readEntry: 3, readExit: 1.1, drink: 8, stretch: 6 });
+export const ACTIVITY_NAMES = Object.freeze(['read', 'drink', 'stretch', 'move_cup']);
+export const ACTIVITY_TIMING = Object.freeze({ readEntry: 3, readExit: 1.1, drink: 8, stretch: 6, move_cup: 8 });
+
+// A brief visual suggestion, not a measurement of reading comprehension.
+// Once interrupted or completed, this page holds still until a new page/entry.
+export function stepReadingGaze(state, rawDt, { enabled = false, phase, cancelling = false, lineCount = 0, pageKey = '', episodeKey = '' } = {}) {
+  const key = `${episodeKey}:${pageKey}`;
+  const previous = state?.key === key ? state : { key, elapsed: 0, started: false, complete: false, line: 0, fixation: .5 };
+  const active = enabled && phase === 'reading' && !cancelling && lineCount > 0;
+  if (!active) return { ...previous, active: false, scanning: false, complete: previous.complete || previous.started };
+  const duration = Math.min(4.55, lineCount * 1.95);
+  const dt = Number.isFinite(rawDt) ? clamp(rawDt, 0, .05) : 0;
+  const elapsed = previous.started ? Math.min(duration, previous.elapsed + dt) : 0;
+  const complete = previous.complete || elapsed >= duration;
+  const index = Math.floor((complete ? duration - .001 : elapsed) / .65);
+  return { key, active: true, scanning: !complete, started: true, complete, elapsed,
+    line: Math.min(lineCount - 1, Math.floor(index / 3)), fixation: complete ? .5 : [0, .5, 1][index % 3] };
+}
 
 export function createActivityState(name, { durationSeconds = null, anchors = {} } = {}) {
   if (!ACTIVITY_NAMES.includes(name)) return null;
@@ -21,6 +37,8 @@ export function createActivityState(name, { durationSeconds = null, anchors = {}
       readRight: anchors.readRight ?? [-0.135, 0.55, 0.17],
       book: anchors.book ?? [0, 0.55, 0.35],
       cupPickup: anchors.cupPickup ?? [-0.13, 0.54, 0.17],
+      cupDestination: anchors.cupDestination ?? anchors.cupPickup ?? [-0.13, 0.54, 0.17],
+      cupTransferNoop: anchors.cupTransferNoop ?? false,
       // Leave a small lip clearance for the head's breathing/gaze motion.
       cupSip: anchors.cupSip ?? [0, 0.550, 0.116],
       cupSupport: anchors.cupSupport ?? [0.08, 0.505, 0.17],
@@ -58,7 +76,7 @@ function readFrame(state) {
   frame.pitchLimit = 0.52;
   frame.spineLean = 0.025 * reach * (1 - exit);
   // One visible page turn after settling, then a quiet interval to actually read.
-  if (t > 7 && !leaving) {
+  if (t > 7 && !leaving && (state.pageTurnCycle === undefined || state.pageTurnCycle === Math.floor((t - 7) / 9))) {
     const age = (t - 7) % 9;
     if (age < 1.25) {
       frame.pageFlip = interval(age, 0, 1.25);
@@ -103,11 +121,47 @@ function stretchFrame(state) {
   return frame;
 }
 
+function moveCupFrame(state) {
+  const frame = emptyFrame(state), { anchors: a, elapsed: t } = state;
+  if (a.cupTransferNoop) return { ...frame, phase: 'already-placed', started: true, done: true };
+  const reach = interval(t, 0, 1.6), lift = interval(t, 2, 3), slide = interval(t, 3, 4.5);
+  const lower = interval(t, 4.5, 5.5), withdraw = interval(t, 7, 8);
+  frame.phase = t < 1.6 ? 'reaching-cup' : t < 2 ? 'gripping-cup' : t < 3 ? 'lifting-cup'
+    : t < 4.5 ? 'moving-cup' : t < 5.5 ? 'lowering-cup' : t < 6.4 ? 'settling-cup' : 'withdrawing-hands';
+  frame.started = t >= .35;frame.done = t >= ACTIVITY_TIMING.move_cup;
+  frame.rightWeight = reach * (1 - withdraw);
+  frame.rightWrist = vector(vector(a.restRight, a.cupPickup, reach), a.cupDestination, slide);
+  frame.rightWrist[1] += .03 * lift * (1 - lower);
+  // The wider transfer reach uses a looser grip than the existing sip pose.
+  frame.rightCurl = interval(t, 1.45, 1.9) * (1 - interval(t, 6.1, 6.6)) * .32;
+  frame.shouldHoldCup = t >= 1.8 && t < 6.4;
+  frame.lookAt = a.cup;frame.pitchLimit = .10;
+  return frame;
+}
+
+function cancelMoveCupFrame(state, frame) {
+  const from = state.cancelFrom, a = state.anchors, t = state.cancelElapsed;
+  const safeHeight = Math.max(from.rightWrist[1], a.cupPickup[1] + .03, a.cupDestination[1] + .03);
+  const raised = [...from.rightWrist];raised[1] = safeHeight;
+  const aboveSource = [...a.cupPickup];aboveSource[1] = safeHeight;
+  frame.rightWrist = vector(from.rightWrist, raised, interval(t, 0, .45));
+  frame.rightWrist = vector(frame.rightWrist, aboveSource, interval(t, .45, 1.3));
+  frame.rightWrist = vector(frame.rightWrist, a.cupPickup, interval(t, 1.3, 1.8));
+  frame.phase = t < .45 ? 'lifting-cup' : t < 1.3 ? 'returning-cup' : t < 2.05 ? 'settling-cup' : 'withdrawing-hands';
+  frame.rightWeight = 1 - interval(t, 2.2, 2.8);
+  frame.rightTilt = from.rightTilt * (1 - interval(t, 0, .45));
+  frame.rightCurl = from.rightCurl * (1 - interval(t, 1.9, 2.25));
+  frame.shouldHoldCup = t < 2.05;
+  frame.lookAt = a.cup;frame.done = t >= 2.8;
+  return frame;
+}
+
 export function sampleActivity(state) {
   if (!state) return null;
-  if (!state.cancelling) return state.name === 'read' ? readFrame(state) : state.name === 'drink' ? drinkFrame(state) : stretchFrame(state);
+  if (!state.cancelling) return state.name === 'read' ? readFrame(state) : state.name === 'drink' ? drinkFrame(state) : state.name === 'move_cup' ? moveCupFrame(state) : stretchFrame(state);
   const from = state.cancelFrom, frame = { ...from, cancelling: true, elapsed: state.elapsed, started: from.started };
   const time = state.cancelElapsed;
+  if (state.name === 'move_cup' && from.shouldHoldCup) return cancelMoveCupFrame(state, frame);
   if (from.shouldHoldCup) {
     const putBack = interval(time, 0, 1.0), withdraw = interval(time, 1.2, 1.8);
     frame.phase = time < 1.15 ? 'returning-cup' : 'withdrawing-hands';
@@ -147,8 +201,16 @@ export function cancelActivityState(state, { holdingProp } = {}) {
   return { ...state, cancelling: true, cancelElapsed: 0, cancelFrom: from };
 }
 
-export function stepActivity(state, rawDt) {
+export function stepActivity(state, rawDt, { pageTurnAllowed } = {}) {
   if (!state) return null;
   const dt = Number.isFinite(rawDt) ? clamp(rawDt, 0, 0.05) : 0;
-  return { ...state, elapsed: state.elapsed + dt, cancelElapsed: state.cancelElapsed + (state.cancelling ? dt : 0) };
+  const elapsed = state.elapsed + dt;
+  const next = { ...state, elapsed, cancelElapsed: state.cancelElapsed + (state.cancelling ? dt : 0) };
+  if (state.name === 'read' && typeof pageTurnAllowed === 'boolean') {
+    next.pageTurnCycle ??= -1;
+    const cycle = Math.floor((elapsed - 7) / 9), start = 7 + cycle * 9;
+    // Gaining eligibility part-way through a slot must not make the leaf jump.
+    if (cycle >= 0 && state.elapsed < start) next.pageTurnCycle = pageTurnAllowed ? cycle : -1;
+  }
+  return next;
 }

@@ -543,6 +543,7 @@ test('the change-activity button requests a new intention and rejects a disguise
   assert.equal(payloads[0].autonomy.requestedChange, false);
   f.advance(10_000); assert.equal(f.controller.requestNow().ok, true); await flush();
   assert.equal(payloads[1].autonomy.requestedChange, true);
+  assert.equal(payloads[1].autonomy.canSpeak, false);
   assert.equal(f.applied.length, 1, 'a continued activity must not masquerade as the requested change');
   assert.equal(f.errors.length, 1);
   assert.equal(f.controller.getState().status, 'error');

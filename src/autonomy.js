@@ -1,4 +1,6 @@
 import { activityFeedback, activityWorld, sanitizeActivityJournal } from './activity-journal.js';
+import { normalizeNextIntent, memoryRevision, captureIntentContext, changedIntentContext, advanceIntentReading } from './autonomy-intent.js';
+import { postLocalJson, invalidLocalResponse, hasActionList } from './local-request.js';
 
 const INITIAL_WAIT_MS = 12_000;
 const USER_QUIET_MS = 45_000;
@@ -8,18 +10,34 @@ const HOUR_MS = 3_600_000;
 const HISTORY_MS = 7 * 24 * HOUR_MS;
 const HOURLY_LIMIT = 24;
 const clone = (value) => JSON.parse(JSON.stringify(value));
+const QUIET_RECOVERY_MS = 120_000;
+// These proofs never enter storage or survive a page reload. Their identity
+// binds a single recovery attempt to the controller that sealed the journal.
+const quietDwellProofs = new WeakMap();
+const writerIdentity = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+function quietAnchor(snapshot) {
+  const world = snapshot?.world;
+  if (!snapshot?.ready || !snapshot.idle || snapshot.typing || snapshot.chatBusy
+      || !['seated', 'idle', 'standing'].includes(world?.posture) || world.activity != null
+      || (world.cup != null && world.cup.held !== false)
+      || typeof memoryRevision(snapshot) !== 'string') return null;
+  const context = captureIntentContext(snapshot);
+  return context && { context, memoryRevision: memoryRevision(snapshot) };
+}
+
+function quietActivityMatches(current, snapshot) {
+  const expected = current?.world, actual = snapshot?.world;
+  return Boolean(current?.phase === 'dwelling' && !current.dwellComplete
+    && current.segmentVisibleSeconds < current.dwellSeconds && expected?.activity == null
+    && Number.isFinite(expected?.position?.x) && Number.isFinite(expected?.position?.z)
+    && expected.position.x === actual?.position?.x && expected.position.z === actual?.position?.z
+    && expected.posture === actual?.posture && expected.gaze === actual?.gaze);
+}
 
 async function requestPlan(payload, { signal }) {
-  const response = await fetch('/api/autonomy', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload), signal,
-  });
-  const body = await response.json();
-  if (!response.ok) {
-    const error = new Error(body.error || '暂时没想好接下来做什么。');
-    error.code = body.code; error.status = response.status; error.retryAt = body.retryAt;
-    throw error;
-  }
+  const body = await postLocalJson('/api/autonomy', payload, { signal, fallback: '暂时没想好接下来做什么。' });
+  if (typeof body.activity !== 'string' || typeof body.reply !== 'string' || !hasActionList(body.actions)) throw invalidLocalResponse();
   return body;
 }
 
@@ -56,6 +74,7 @@ function omitSatisfiedActions(actions, world, continuing) {
     if (action.type === 'sit' && world.posture === 'seated') return false;
     if (action.type === 'stand' && ['idle', 'standing'].includes(world.posture)) return false;
     if (action.type === 'look_at' && action.target === world.gaze) return false;
+    if (action.type === 'move_cup' && world.cup?.spot === action.target && world.cup.held === false) return false;
     if (action.type === 'read' && continuing && isReadingActivity(world.activity, continuing)) return false;
     if (action.type === 'move_to' && ['idle', 'standing'].includes(world.posture)) {
       const destination = world.availableTargets?.find((place) => place.id === action.target);
@@ -73,6 +92,7 @@ function omitSatisfiedActions(actions, world, continuing) {
 export function createAutonomyController({
   getSnapshot, onPlan, onStatus = () => {}, onError = () => {},
   fetchPlan = requestPlan, now = Date.now, initialEnabled = true, journal = null,
+  allowNextIntent = true, quietDwellRecovery = null,
 }) {
   let restored = null;
   try { restored = sanitizeActivityJournal(journal?.load(), now()); } catch { /* Optional persistence. */ }
@@ -85,12 +105,34 @@ export function createAutonomyController({
   const requests = restored?.requestTimes ?? [];
   let lastRequestAt = requests.at(-1) ?? -Infinity;
   let lastDecisionSpeechAllowed = null, lastDecisionAt = null;
+  let pendingIntent = null, lastIntentEvent = null, intentSequence = 0;
   let serverBlockedUntil = restored?.serverBlockedUntil ?? 0;
   const recentActivities = restored?.recentActivities ?? [];
   let currentActivity = restored?.currentActivity ?? null;
   let activityFeedbackCursor = [];
   let activity = '', reason = '', status = enabled ? 'waiting' : 'off', lastPublished = '';
   let errorReported = false, lastObservedAt = now(), lastDwellEligible = false, lastSavedAt = -Infinity;
+  const writerId = writerIdentity();
+  let recoveredQuietDwell = false;
+
+  // Validate before this new owner's first write invalidates the old receipt.
+  // A clone, serialized token, stale journal, intervening owner, changed body
+  // or changed context cannot restore an activity.
+  const recovery = quietDwellRecovery && quietDwellProofs.get(quietDwellRecovery);
+  if (quietDwellRecovery) quietDwellProofs.delete(quietDwellRecovery);
+  if (recovery && enabled && now() >= recovery.issuedAt && now() <= recovery.issuedAt + QUIET_RECOVERY_MS
+      && JSON.stringify(restored) === recovery.sealedJournal) {
+    const snapshot = getSnapshot(), anchor = quietAnchor(snapshot);
+    if (snapshot.visible && snapshot.renderActive !== false && anchor
+        && quietActivityMatches(currentActivity, snapshot)
+        && JSON.stringify(anchor) === recovery.anchor) {
+      recoveredQuietDwell = true;
+      activity = currentActivity.activity; status = 'resting';
+      activityFeedbackCursor = clone(snapshot.feedback || []);
+      lastObservedAt = now(); lastDwellEligible = true;
+      nextAt = Math.max(nextAt, now() + (currentActivity.dwellSeconds - currentActivity.segmentVisibleSeconds) * 1000);
+    }
+  }
 
   function pruneRequests() {
     while (requests.length && requests[0] <= now() - HOUR_MS) requests.shift();
@@ -103,11 +145,13 @@ export function createAutonomyController({
     if (!journal || (!force && now() - lastSavedAt < 10_000)) return;
     pruneRequests();
     try {
-      journal.save({
+      const receipt = journal.save({
         version: 1, currentActivity, recentActivities, requestTimes: requests, lastUserAt, serverBlockedUntil,
+        writerId,
         speech: { lastSpeechAt: Number.isFinite(lastSpeechAt) ? lastSpeechAt : null, unansweredProactive: spokenSinceConversation },
       });
       lastSavedAt = now();
+      return receipt;
     } catch { /* An optional journal must never stop actions or chat. */ }
   }
 
@@ -115,9 +159,15 @@ export function createAutonomyController({
     pruneRequests();
     return {
       enabled, status, activity, reason,
+      recoveredQuietDwell,
       nextAt: enabled && !paused && !active ? nextAt : null,
       requestCount: requests.length,
       lastDecisionSpeechAllowed, lastDecisionAt,
+      nextIntent: pendingIntent ? {
+        after: pendingIntent.intent.after, parentActivityId: pendingIntent.parentActivityId,
+        plannedByRequestAt: pendingIntent.plannedByRequestAt, expiresAt: pendingIntent.expiresAt,
+      } : null,
+      lastIntentEvent: lastIntentEvent ? { ...lastIntentEvent } : null,
       currentActivity: currentActivity ? clone(currentActivity) : null,
     };
   }
@@ -133,6 +183,7 @@ export function createAutonomyController({
 
   function finishActivity(endReason, forcedOutcome) {
     if (!currentActivity) return;
+    discardIntent(endReason);
     if (currentActivity.phase !== 'executing' && endReason !== 'reload') {
       // Main records safe exits before notifyUser(). Retain that actual result
       // even though the model request/action queue has already finished.
@@ -153,8 +204,11 @@ export function createAutonomyController({
   }
 
   // Restore an intention as history, never as a restored body or offline work.
-  if (currentActivity) finishActivity('reload', 'interrupted');
+  if (currentActivity && !recoveredQuietDwell) finishActivity('reload', 'interrupted');
   nextAt = Math.max(nextAt, lastUserAt + (restored ? USER_QUIET_MS : 0), lastRequestAt + MIN_REQUEST_MS, serverBlockedUntil);
+  // Claim a new journal revision even if this owner never requests a model.
+  // This prevents an older page from resuming across an intervening owner.
+  persist();
 
   function observe(snapshot = getSnapshot(), { closingInterval = false, checkWorld = true } = {}) {
     const time = now();
@@ -191,7 +245,8 @@ export function createAutonomyController({
     activityFeedbackCursor = clone(getSnapshot().feedback || []);
   }
 
-  function cancelRequest() {
+  function cancelRequest(reason = 'cancelled') {
+    discardIntent(reason);
     generation++;
     if (active) {
       active.controller.abort();
@@ -210,11 +265,12 @@ export function createAutonomyController({
       ...(snapshot.memory ? { memory: snapshot.memory } : {}),
       autonomy: {
         requestedChange,
+        allowNextIntent: allowNextIntent === true,
         currentActivity: currentActivity ? clone(currentActivity) : null,
         recentActivities: clone(recentActivities.slice(-8)),
         secondsSinceUser: Math.max(0, Math.floor((now() - lastUserAt) / 1000)),
         secondsSinceSpeech: Number.isFinite(lastSpeechAt) ? Math.max(0, Math.floor((now() - lastSpeechAt) / 1000)) : null,
-        canSpeak: canSpeak(snapshot),
+        canSpeak: !requestedChange && canSpeak(snapshot),
         localTime: new Date(now()).toLocaleString('zh-CN', { hour12: false }),
       },
     };
@@ -235,20 +291,75 @@ export function createAutonomyController({
     return '';
   }
 
-  async function decide(snapshot, { requestedChange = false } = {}) {
+  function intentEvent(event, intent, reason = '', activityId) {
+    lastIntentEvent = { sequence: ++intentSequence, at: now(), event, reason,
+      parentActivityId: intent.parentActivityId, plannedByRequestAt: intent.plannedByRequestAt,
+      ...(activityId ? { activityId } : {}),
+    };
+  }
+
+  function discardIntent(reason) {
+    if (!pendingIntent) return;
+    intentEvent('discarded', pendingIntent, reason);pendingIntent = null;
+  }
+
+  function armIntent(value, run, result) {
+    if (allowNextIntent !== true || result?.status !== 'completed' || currentActivity?.phase !== 'dwelling') return;
+    const intent = normalizeNextIntent(value), snapshot = getSnapshot();
+    if (!intent || memoryRevision(snapshot) !== run.memoryRevision || !snapshot.ready || !snapshot.idle
+        || !snapshot.visible || snapshot.renderActive === false || snapshot.typing || snapshot.chatBusy) return;
+    const anchor = captureIntentContext(snapshot);
+    if (!anchor || !worldMatches(currentActivity.world, snapshot.world)) return;
+    if (intent.after === 'book_complete' && (
+      !isReadingActivity(snapshot.world?.activity, currentActivity.id)
+      || !anchor.reading || anchor.reading.activityId === null || anchor.reading.status !== 'open'
+      || anchor.reading.allPagesRead || run.requestBookComplete
+    )) return;
+    pendingIntent = {
+      intent, anchor, parentActivityId: currentActivity.id, generation,
+      plannedByRequestAt: run.plannedByRequestAt, memoryRevision: run.memoryRevision,
+      expiresAt: now() + (currentActivity.dwellSeconds + 30) * 1000,
+      bookCompleted: false,
+    };
+    intentEvent('armed', pendingIntent);
+  }
+
+  function inspectIntent(snapshot) {
+    if (!pendingIntent) return;
+    const pending = pendingIntent;
+    const reason = allowNextIntent !== true ? 'disabled'
+      : pending.generation !== generation || pending.parentActivityId !== currentActivity?.id ? 'parent_changed'
+      : memoryRevision(snapshot) !== pending.memoryRevision ? 'memory_changed'
+      : now() > pending.expiresAt ? 'expired'
+      : changedIntentContext(pending.anchor, snapshot, pending.intent.after);
+    if (reason) { discardIntent(reason);return; }
+    if (pending.intent.after === 'book_complete') pending.bookCompleted ||= advanceIntentReading(pending.anchor, snapshot);
+  }
+
+  async function decide(snapshot, { requestedChange = false, planned = null } = {}) {
     const token = generation, controller = new AbortController();
-    const run = { controller, phase: 'thinking', beforeFeedback: snapshot.feedback || [], activityId: null, feedbackCaptured: false };
-    active = run; lastRequestAt = now(); requests.push(lastRequestAt); persist();
+    const run = { controller, phase: 'thinking', beforeFeedback: clone(snapshot.feedback || []), activityId: null, feedbackCaptured: false,
+      memoryRevision: memoryRevision(snapshot), requestBookComplete: snapshot.world?.reading?.allPagesRead === true,
+      plannedByRequestAt: planned?.plannedByRequestAt ?? now() };
+    discardIntent('replanned');
+    active = run;
+    if (!planned) { lastRequestAt = now(); requests.push(lastRequestAt);persist(); }
     try {
       const payload = context(snapshot, requestedChange);
-      lastDecisionSpeechAllowed = payload.autonomy.canSpeak;
-      lastDecisionAt = now();
-      publish('thinking', '正在想接下来做什么');
-      const returned = await fetchPlan(payload, { signal: controller.signal });
+      if (!planned) {
+        lastDecisionSpeechAllowed = payload.autonomy.canSpeak;
+        lastDecisionAt = now();
+        publish('thinking', '正在想接下来做什么');
+      }
+      const returned = planned ? { ...planned.intent, continuationOf: null, reply: '', expression: 'neutral', nextIntent: null }
+        : await fetchPlan(payload, { signal: controller.signal });
       if (disposed || token !== generation || controller.signal.aborted) return;
       const latest = getSnapshot();
       if (!latest.visible || latest.renderActive === false) { pauseForHidden(); return; }
       if (latest.typing || latest.chatBusy) { notifyUser(); return; }
+      if (memoryRevision(latest) !== run.memoryRevision) {
+        cancelRequest('memory_changed');nextAt = now() + USER_QUIET_MS;publish('waiting', '');return;
+      }
       if (!latest.ready || !latest.idle) {
         cancelRequest(); nextAt = now() + USER_QUIET_MS; publish('waiting'); return;
       }
@@ -271,11 +382,14 @@ export function createAutonomyController({
       currentActivity.segmentVisibleSeconds = 0;
       currentActivity.dwellSeconds = Math.max(60, Math.min(240, Number(returned.dwellSeconds) || 120));
       currentActivity.dwellComplete = false;
+      const { nextIntent, after: _after, ...immediate } = returned;
       const plan = {
-        ...returned, continuationOf: continuing, activityId: currentActivity.id,
+        ...immediate, continuationOf: continuing, activityId: currentActivity.id,
         reply: payload.autonomy.canSpeak && canSpeak(latest) ? returned.reply : '',
         actions: omitSatisfiedActions(returned.actions, latest.world || {}, continuing),
+        ...(planned ? { executionSource: 'planned-next', plannedByRequestAt: planned.plannedByRequestAt, parentActivityId: planned.parentActivityId } : {}),
       };
+      if (planned) intentEvent('started', planned, '', currentActivity.id);
       run.phase = 'acting'; run.activityId = currentActivity.id;
       activity = currentActivity.activity;
       if (plan.reply?.trim()) { lastSpeechAt = now(); spokenSinceConversation = true; }
@@ -297,6 +411,7 @@ export function createAutonomyController({
           currentActivity.phase = 'dwelling';
           lastObservedAt = now(); lastDwellEligible = false;
           observe();
+          if (!planned) armIntent(nextIntent, run, result);
         }
       }
       errorReported = false;
@@ -325,21 +440,21 @@ export function createAutonomyController({
   function notifyUser({ conversation = false } = {}) {
     if (disposed) return;
     observe(getSnapshot(), { closingInterval: !paused, checkWorld: false });
-    cancelRequest(); finishActivity('user', 'interrupted');
+    cancelRequest('user'); finishActivity('user', 'interrupted');
     lastUserAt = now();
     if (conversation) spokenSinceConversation = false;
     nextAt = now() + USER_QUIET_MS;
     persist(); publish(!enabled ? 'off' : paused ? 'paused' : 'waiting', '先听你说');
   }
 
-  function noteSpeech() { if (disposed) return; lastSpeechAt = now(); persist(); }
+  function noteSpeech() { if (disposed) return; discardIntent('speech');lastSpeechAt = now(); persist(); }
 
   function pauseForHidden() {
     if (disposed || paused) return;
     observe(getSnapshot(), { closingInterval: true, checkWorld: false });
     paused = true;
     const wasExecuting = currentActivity?.phase === 'executing';
-    cancelRequest();
+    cancelRequest('hidden');
     if (wasExecuting) finishActivity('hidden', 'interrupted');
     lastDwellEligible = false;
     persist(); publish(enabled ? 'paused' : 'off', '回到房间后继续');
@@ -364,6 +479,7 @@ export function createAutonomyController({
       return;
     }
     observe(snapshot);
+    inspectIntent(snapshot);
     const blocked = blockedReason(snapshot);
     if (blocked) {
       if (!active && now() < serverBlockedUntil) {
@@ -379,11 +495,22 @@ export function createAutonomyController({
       return;
     }
     if (now() < nextAt) return;
+    if (pendingIntent) {
+      const pending = pendingIntent;
+      if (canSpeak(snapshot)) discardIntent('speech_opportunity');
+      else if (pending.intent.after === 'book_complete' && !pending.bookCompleted) discardIntent('book_incomplete');
+      else if (!omitSatisfiedActions(pending.intent.actions, snapshot.world || {}, null).length) discardIntent('already_satisfied');
+      else {
+        pendingIntent = null;
+        await decide(snapshot, { planned: pending });return;
+      }
+    }
     await decide(snapshot);
   }
 
   function requestNow() {
     if (disposed) return { ok: false, reason: '自主陪伴还没有启动。' };
+    discardIntent('requested_change');
     const snapshot = getSnapshot();
     observe(snapshot);
     const blocked = blockedReason(snapshot);
@@ -431,7 +558,7 @@ export function createAutonomyController({
   function setEnabled(value) {
     if (disposed || enabled === Boolean(value)) return;
     observe(getSnapshot(), { closingInterval: !paused, checkWorld: false });
-    enabled = Boolean(value); cancelRequest(); finishActivity('disabled', 'interrupted');
+    enabled = Boolean(value); cancelRequest('disabled'); finishActivity('disabled', 'interrupted');
     if (enabled) nextAt = Math.max(now() + INITIAL_WAIT_MS, lastUserAt + USER_QUIET_MS);
     persist(); publish(enabled ? paused ? 'paused' : 'waiting' : 'off', enabled ? '' : '由你来安排活动');
   }
@@ -450,12 +577,24 @@ export function createAutonomyController({
     persist(); publish();
   }
 
-  function dispose() {
-    if (disposed) return;
+  function dispose({ preserveQuietDwell = false } = {}) {
+    if (disposed) return null;
     observe(getSnapshot(), { closingInterval: !paused, checkWorld: false });
-    cancelRequest(); persist();
+    const snapshot = getSnapshot();
+    const anchor = preserveQuietDwell && enabled && paused && !active
+      && quietActivityMatches(currentActivity, snapshot) ? quietAnchor(snapshot) : null;
+    cancelRequest('disposed');
+    const receipt = persist();
+    let proof = null;
+    if (anchor && receipt?.writerId === writerId && receipt.revision
+        && quietActivityMatches(receipt.currentActivity, snapshot)) {
+      proof = Object.freeze({ kind: 'same-page-quiet-dwell' });
+      quietDwellProofs.set(proof, { issuedAt: now(), sealedJournal: JSON.stringify(receipt),
+        anchor: JSON.stringify(anchor) });
+    }
     disposed = true; enabled = false;
     clearInterval(timer); publish('off', '');
+    return proof;
   }
 
   return { start, dispose, tick, setEnabled, notifyUser, noteSpeech, requestNow, adoptActivity, pauseForHidden, resumeVisible, clearMemory, getState };

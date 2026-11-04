@@ -2,8 +2,32 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { createRoomActivities } from './room-activities.js';
+import { SIDE_TABLE } from './navigation.js';
 
 const mat = (color, roughness = .85) => new THREE.MeshStandardMaterial({ color, roughness });
+
+// The decorative books repeat four exact sizes/materials. Keep one geometry per
+// size (including its original UVs), and move copies with translation only.
+export function createBookcaseBooks(parent) {
+  const colors = ['#c8c3a1', '#809585', '#bd927a', '#d8c9a6'];
+  const transform = new THREE.Matrix4();
+  return colors.map((color, variant) => {
+    const height = .23 + variant * .045;
+    const indices = Array.from({ length: Math.ceil((17 - variant) / 4) }, (_, index) => variant + index * 4);
+    const books = new THREE.InstancedMesh(new THREE.BoxGeometry(.3, height, .068), mat(color), indices.length);
+    books.name = `BookcaseBooks${variant}`;
+    indices.forEach((index, instance) => books.setMatrixAt(instance,
+      transform.makeTranslation(3.12, .22 + height / 2, -1.38 + index * .105)));
+    books.instanceMatrix.needsUpdate = true;
+    books.castShadow = true; books.receiveShadow = true;
+    // Instances are static. Compute aggregate bounds once so camera and shadow
+    // culling include every book in the group, including the end books.
+    books.computeBoundingBox(); books.computeBoundingSphere();
+    parent.add(books);
+    return books;
+  });
+}
+
 export function createRoom(container) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#e9e5da');
@@ -17,7 +41,10 @@ export function createRoom(container) {
   container.prepend(renderer.domElement);
   const camera = new THREE.PerspectiveCamera(38, 1, .05, 80);
   camera.position.set(7.2, 5.2, 9.7);
-  const controls = new OrbitControls(camera, renderer.domElement);
+  // Keep the orbit the user asked for separate from the camera actually used
+  // to render. Obstacle avoidance must not permanently shorten their orbit.
+  const orbitCamera = camera.clone();
+  const controls = new OrbitControls(orbitCamera, renderer.domElement);
   controls.target.set(-.15, .75, -.2);
   controls.enableDamping = true;
   controls.dampingFactor = .07;
@@ -26,6 +53,7 @@ export function createRoom(container) {
   controls.maxPolarAngle = Math.PI * .485;
   controls.minPolarAngle = .18;
   controls.enablePan = false;
+  camera.lookAt(controls.target);
   scene.add(new THREE.HemisphereLight(0xfff7e9, 0x9aa381, 2.25));
   const sun = new THREE.DirectionalLight(0xffedd0, 3.2);
   sun.position.set(-4, 7, 2);
@@ -107,25 +135,31 @@ export function createRoom(container) {
   const sofaFabric = fabric('#8b9a79');
   const sofa = new THREE.Group();scene.add(sofa);
   // Seat top at .50m, matching the companion's folded leg geometry.
-  for(const x of [-2.2,.6]) for(const z of [-2.65,-1.86]) cylinder(.035,.028,.2,walnut,x,.1,z);
-  box(3.25,.24,1.06,sofaFabric,-.8,.23,-2.24,.09);
-  for(const x of [-1.6,0]) box(1.52,.18,.91,sofaFabric,x,.41,-2.16,.07);
-  box(3.2,.66,.24,sofaFabric,-.8,.76,-2.72,.09);
-  for(const x of [-2.4,.8])box(.22,.57,1.1,sofaFabric,x,.52,-2.25,.075);
+  for(const x of [-2.2,.6]) for(const z of [-2.65,-1.86]) sofa.add(cylinder(.035,.028,.2,walnut,x,.1,z));
+  sofa.add(box(3.25,.24,1.06,sofaFabric,-.8,.23,-2.24,.09));
+  for(const x of [-1.6,0]) sofa.add(box(1.52,.18,.91,sofaFabric,x,.41,-2.16,.07));
+  sofa.add(box(3.2,.66,.24,sofaFabric,-.8,.76,-2.72,.09));
+  for(const x of [-2.4,.8])sofa.add(box(.22,.57,1.1,sofaFabric,x,.52,-2.25,.075));
   const pillow1=box(.5,.49,.15,fabric('#d2bf8d'),-1.96,.75,-2.52,.09);pillow1.rotation.z=.15;pillow1.rotation.x=-.2;
   const pillow2=box(.48,.43,.17,fabric('#d7d8bc'),.35,.72,-2.51,.09);pillow2.rotation.z=-.19;pillow2.rotation.x=-.25;
-  const rug = box(3.65,.025,2.75,fabric('#ded5b9'),-.1,.016,.4,.09);rug.castShadow=false;
+  sofa.add(pillow1,pillow2);
+  const rugSize = { width: 3.65, height: .025, depth: 2.75 };
+  const rug = box(rugSize.width,rugSize.height,rugSize.depth,fabric('#ded5b9'),-.1,.016,.4,.09);rug.castShadow=false;
+  function groundHeightAt(x,z) {
+    return Math.abs(x-rug.position.x)<=rugSize.width/2&&Math.abs(z-rug.position.z)<=rugSize.depth/2
+      ? rug.position.y+rugSize.height/2 : .0025;
+  }
   const fringePositions = [];
   for(let z=-.8;z<1.7;z+=.1){fringePositions.push([-1.97,.032,z],[1.77,.032,z]);}
   instances(new THREE.BoxGeometry(.11,.01,.025), cream, fringePositions);
   for (const x of [-.63,.63])for(const z of [.17,.83]){const leg=cylinder(.036,.026,.38,walnut,x,.2,z);leg.rotation.z=x*.12;}
-  box(1.65,.085,1,wood,0,.425,.5,.13);
+  const tableTop=box(1.65,.085,1,wood,0,.425,.5,.13);
   const activities = createRoomActivities(scene);
   // Low bookcase and an articulated table lamp.
-  box(.68,.85,2.25,walnut,3.42,.47,-.45,.025);
+  const cabinet=box(.68,.85,2.25,walnut,3.42,.47,-.45,.025);
   for(const z of [-1.15,-.43,.29])box(.025,.61,.54,mat('#403f32'),3.057,.48,z);
-  for(let i=0;i<17;i++){const z=-1.38+i*.105;const h=.23+(i%4)*.045;box(.3,h,.068,mat(['#c8c3a1','#809585','#bd927a','#d8c9a6'][i%4]),3.12,.22+h/2,z);}
-  box(.8,.065,2.4,wood,3.4,.94,-.45,.025);
+  createBookcaseBooks(scene);
+  const cabinetTop=box(.8,.065,2.4,wood,3.4,.94,-.45,.025);
   cylinder(.16,.17,.035,metal,3.37,1,-1.15);
   cylinder(.016,.016,.5,metal,3.37,1.25,-1.15);
   cylinder(.13,.23,.23,cream,3.37,1.53,-1.15);
@@ -153,15 +187,36 @@ export function createRoom(container) {
     const mesh=new THREE.Mesh(new THREE.PlaneGeometry(w,h),new THREE.MeshStandardMaterial({map:tex,roughness:1}));mesh.position.set(x,y,z+.032);scene.add(mesh);
   }
   art(-1.22,1.99,-3.19,.71,.94,0);art(-.19,1.99,-3.19,.71,.94,1);
-  // Side table, vase, and a small reading light.
-  cylinder(.33,.31,.065,wood,-2.97,.53,-2.28);
-  for(let i=0;i<3;i++){const angle=i*Math.PI*2/3;cylinder(.023,.018,.5,walnut,-2.97+Math.cos(angle)*.23,.25,-2.28+Math.sin(angle)*.23);}
-  cylinder(.07,.11,.22,mat('#e1d4bc'),-2.97,.67,-2.28);
-  for(let i=0;i<3;i++){const st=cylinder(.006,.007,.4,stemMat,-2.97+i*.03,.92,-2.28,8);st.rotation.z=(i-1)*.2;}
+  // Side table and vase; share the tabletop footprint with navigation.
+  const {x:sideX,z:sideZ,radius:sideRadius}=SIDE_TABLE;
+  const sideTableTop=cylinder(sideRadius,.31,.065,wood,sideX,.53,sideZ);
+  for(let i=0;i<3;i++){const angle=i*Math.PI*2/3;cylinder(.023,.018,.5,walnut,sideX+Math.cos(angle)*.23,.25,sideZ+Math.sin(angle)*.23);}
+  cylinder(.07,.11,.22,mat('#e1d4bc'),sideX,.67,sideZ);
+  for(let i=0;i<3;i++){const st=cylinder(.006,.007,.4,stemMat,sideX+i*.03,.92,sideZ,8);st.rotation.z=(i-1)*.2;}
   // Movement marker, shown only for the active destination.
   const marker=new THREE.Mesh(new THREE.RingGeometry(.13,.18,48),new THREE.MeshBasicMaterial({color:'#91a773',transparent:true,opacity:.7,side:THREE.DoubleSide,depthWrite:false}));
   marker.rotation.x=-Math.PI/2;marker.position.y=.045;marker.visible=false;scene.add(marker);
-  function resize(){const w=container.clientWidth,h=container.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();}
+  const pickable=new Map([[ground,'floor'],[sofa,'sit'],[activities.book,'read'],[activities.cup,'drink'],[tableTop,'blocked'],[sideTableTop,'blocked'],[cabinet,'blocked']]);
+  const pickObjects=[...pickable.keys()];
+  function pick(ray,actor){
+    for(const hit of ray.intersectObjects(actor?[...pickObjects,actor]:pickObjects,true)){
+      let node=hit.object;
+      while(node?.visible&&!pickable.has(node)&&node!==actor)node=node.parent;
+      if(!node?.visible)continue;
+      if(node===actor)return null;
+      const kind=pickable.get(node);
+      if(kind==='floor')return {kind,point:{x:hit.point.x,z:hit.point.z}};
+      if(kind==='blocked')return {kind};
+      if(kind==='drink'&&activities.isCupHeld())return null;
+      return {kind:'action',action:kind};
+    }
+    return null;
+  }
+  const cameraObstacles=[...sofa.children,tableTop,sideTableTop,cabinet,cabinetTop].map(object=>{
+    const {min,max}=new THREE.Box3().setFromObject(object);
+    return {minX:min.x,maxX:max.x,minY:min.y,maxY:max.y,minZ:min.z,maxZ:max.z};
+  }).filter(box=>box.maxY>.21);
+  function resize(){const w=Math.max(1,container.clientWidth),h=Math.max(1,container.clientHeight);renderer.setSize(w,h,false);for(const view of [camera,orbitCamera]){view.aspect=w/h;view.updateProjectionMatrix();}}
   const observer=new ResizeObserver(resize);observer.observe(container);resize();
-  return {scene,camera,renderer,controls,ground,marker,activities,resize};
+  return {scene,camera,orbitCamera,renderer,controls,ground,marker,activities,resize,groundHeightAt,pick,cameraObstacles};
 }

@@ -80,11 +80,30 @@ test('sitting rotates continuously before changing the seated blend', () => {
   assert.deepEqual(initial.position, motion.fromPosition);
   assert.ok(Math.abs(angleDelta(initial.yaw, first.yaw)) < .05, 'no instant half-turn');
   assert.equal(first.blend, 0, 'turn before climbing onto the cushion');
-  const final = samplePosture(motion, 3);
+  const final = samplePosture(motion, motion.turnDuration + motion.duration);
   assert.equal(final.done, true);
   assert.equal(final.blend, 1);
   assert.deepEqual(final.position, motion.toPosition);
   assert.ok(Math.abs(angleDelta(final.yaw, 0)) < 1e-9);
+});
+
+test('the calibrated pre-seat turn stays below the locomotion yaw rate before folding', () => {
+  for (const fromYaw of [Math.PI, -Math.PI/2, .2]) {
+    const motion = createPostureMotion({ from:0,to:1,fromPosition:{x:-.85,z:-1.25},toPosition:{x:-.85,z:-1.71},fromYaw });
+    let previous=samplePosture(motion,0),peak=0;
+    for(let frame=1;frame<=Math.ceil(motion.turnDuration/tick);frame++) {
+      const elapsed=Math.min(frame*tick,motion.turnDuration),pose=samplePosture(motion,elapsed);
+      const step=elapsed-Math.min((frame-1)*tick,motion.turnDuration);
+      peak=Math.max(peak,Math.abs(angleDelta(previous.yaw,pose.yaw))/step);
+      assert.equal(pose.blend,0);
+      assert.deepEqual(pose.position,motion.fromPosition);
+      previous=pose;
+    }
+    assert.ok(peak<=2.001);
+    assert.ok(Math.abs(angleDelta(previous.yaw,0))<1e-9);
+  }
+  const legacy=createPostureMotion({from:0,to:1,fromPosition:{x:0,z:0},toPosition:{x:0,z:-.46},fromYaw:Math.PI,seatContactCurve:false});
+  assert.equal(legacy.turnDuration,.7);
 });
 
 test('interrupted sitting and standing recover from the current pose without a first-frame jump', () => {
@@ -101,12 +120,39 @@ test('interrupted sitting and standing recover from the current pose without a f
       const afterOneFrame = samplePosture(recovery, tick);
       assert.ok(Math.abs(afterOneFrame.blend-start.blend) < .02);
       assert.ok(dist(afterOneFrame.position,start.position) < .01);
-      const end = samplePosture(recovery, 1);
+      assert.ok(recovery.duration <= 2.1, 'safe recovery remains a bounded exit');
+      const end = samplePosture(recovery, recovery.duration + recovery.turnDuration);
       assert.equal(end.blend, to);
       assert.deepEqual(end.position, to ? seat : approach);
       assert.equal(end.done, true);
     }
   }
+});
+
+test('full seated blend while still moving to the cushion is not a completed posture', () => {
+  const approach = { x: -.85, z: -1.25 }, seat = { x: -.85, z: -1.71 };
+  const motion = createPostureMotion({ from: 0, to: 1, fromPosition: approach, toPosition: seat, fromYaw: 0 });
+  const midway = samplePosture(motion, 1.2);
+  assert.equal(midway.blend, 1);
+  assert.equal(midway.done, false);
+  assert.ok(midway.position.z > seat.z + .1);
+  for (const to of [0, 1]) {
+    const recovery = createPostureMotion({ from: midway.blend, to, fromPosition: midway.position, toPosition: to ? seat : approach, fromYaw: 0, recovery: true });
+    assert.deepEqual(samplePosture(recovery, 0).position, midway.position);
+    assert.equal(samplePosture(recovery, 0).blend, 1);
+    const final = samplePosture(recovery, recovery.duration);
+    assert.equal(final.done, true);
+    assert.equal(final.blend, to);
+    assert.deepEqual(final.position, to ? seat : approach);
+  }
+});
+
+test('inspection and unsupported avatars can retain the original simultaneous posture path', () => {
+  const motion = createPostureMotion({ from: 0, to: 1, fromPosition: { x: -.85, z: -1.25 }, toPosition: { x: -.85, z: -1.71 }, fromYaw: 0, seatContactCurve: false });
+  const middle = samplePosture(motion, .725);
+  assert.equal(motion.duration, 1.45);
+  assert.equal(middle.blend, .5);
+  assert.equal(middle.position.z, -1.48);
 });
 
 test('hidden time cannot complete a gesture that has not visibly finished', async () => {

@@ -4,7 +4,9 @@ import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import { createFaceController } from './face.js';
 import { configureFacialRig } from './facial-rig.js';
 import { createGaitState, stepGait, GAIT } from './gait.js';
-import { createActivityState, stepActivity, sampleActivity, cancelActivityState } from './activity-rig.js';
+import { createFootPlacement, FOOT_PLACEMENT } from './foot-placement.js';
+import { createTailGround } from './tail-ground.js';
+import { createActivityState, stepActivity, sampleActivity, cancelActivityState, stepReadingGaze } from './activity-rig.js';
 import { loadAvatarModel } from './avatar-loader.js';
 
 const EXPRESSIONS = ['neutral', 'happy', 'sad', 'surprised', 'relaxed'];
@@ -16,12 +18,10 @@ const clamp = THREE.MathUtils.clamp;
  * +Z is forward, y=0 is the floor, units are metres. Animation is deliberately
  * procedural in this prototype, with no learned controller or physics claims.
  */
-export async function createAvatar(scene) {
+export async function createAvatar(scene, { tailGround = false } = {}) {
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
   const { vrm, modelSource, usingFallback } = await loadAvatarModel(loader);
-  // Book/cup reach targets were calibrated against the optional chibi model.
-  const supportedActivities = Object.freeze(usingFallback ? ['stretch'] : ['read', 'drink', 'stretch']);
 
   VRMUtils.rotateVRM0(vrm);
   const root = new THREE.Group();
@@ -82,6 +82,13 @@ export async function createAvatar(scene) {
   const seatedHipHeight = seatSurfaceHeight + pelvisUnderside;
   // Signed: this is negative when getting onto the sofa raises the avatar.
   const sitDrop = hipHeight - seatedHipHeight;
+  const footPlacement = createFootPlacement(vrm, root);
+  const tailGroundRig = createTailGround(vrm, scene, { enabled: tailGround });
+  const cupTransferSupported = footPlacement.supported && vrm.meta?.metaVersion === '1'
+    && vrm.meta.name === '蓝色小肥鱼Deepseek' && vrm.meta.authors?.length === 1 && vrm.meta.authors[0] === '木子恶魔';
+  // Prop reach targets are calibrated for the optional local chibi model.
+  const supportedActivities = Object.freeze(usingFallback ? ['stretch']
+    : ['read', 'drink', 'stretch', ...(cupTransferSupported ? ['move_cup'] : [])]);
 
   const scratchEuler = new THREE.Euler();
   const scratchQuaternion = new THREE.Quaternion();
@@ -102,7 +109,14 @@ export async function createAvatar(scene) {
   let activity = null;
   let activitySequence = 0;
   let activityResult = null;
+  let lastRenderVisible = true;
+  let lastCueEnabled = true;
+  let lastSpeed = 0;
+  const previousRootPosition = root.position.clone();
+  let previousRootYaw = root.rotation.y;
   const activityLookTarget = new THREE.Vector3();
+  const readingEyeTarget = new THREE.Vector3(), readingGazeLocal = new THREE.Vector3();
+  let readingGaze = stepReadingGaze(null, 0);
   const ik = {
     shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), wrist: new THREE.Vector3(),
     target: new THREE.Vector3(), direction: new THREE.Vector3(), pole: new THREE.Vector3(),
@@ -126,32 +140,54 @@ export async function createAvatar(scene) {
   function setGesture(name) {
     if (!['wave', 'nod', 'none'].includes(name)) return false;
     gesture = name === 'none' ? null : name;
+    if (gesture) face.cancelResponseCue();
     gestureStart = time;
     return true;
   }
 
-  function setActivity(name, { props, durationSeconds = null } = {}) {
+  function canUseResponseCue() {
+    return !isDisposed && lastRenderVisible && lastCueEnabled && !activity && !gesture && lastSpeed <= .005
+      && locomotion.blend < .03 && !(sitBlend > .001 && sitBlend < .999)
+      && !['walking', 'settling'].includes(footPlacement.phase);
+  }
+
+  function setAttention(value) {
+    return face.setAttention(value, { allowResponseCue: canUseResponseCue() });
+  }
+
+  function setActivity(name, { props, durationSeconds = null, cupDestination } = {}) {
     if (isDisposed || activity || !supportedActivities.includes(name)) return null;
     if (name !== 'stretch' && !props?.getAnchors) return null;
+    if (props?.getCupState?.().blocked) return null;
+    if (name === 'move_cup' && (!cupTransferSupported || !props?.getCupState?.().supported)) return null;
     const station = props?.stations?.[name];
-    if (station && Math.hypot(root.position.x - station.x, root.position.z - station.z) > 0.18) return null;
-    if (station && (sitBlend > 0.05 || Math.abs(Math.atan2(Math.sin(root.rotation.y - station.yaw), Math.cos(root.rotation.y - station.yaw))) > 0.25)) return null;
+    if (station && Math.hypot(root.position.x - station.x, root.position.z - station.z) > (name === 'move_cup' ? .008 : .18)) return null;
+    if (station && (sitBlend > 0.05 || Math.abs(Math.atan2(Math.sin(root.rotation.y - station.yaw), Math.cos(root.rotation.y - station.yaw))) > (name === 'move_cup' ? .03 : .25))) return null;
+    const cupTransaction = name === 'move_cup' ? props.beginCupTransfer(cupDestination) : null;
+    if (name === 'move_cup' && !cupTransaction) return null;
+    const cupSnapshot = cupTransaction ?? (name === 'drink' ? props.snapshotCupDrink?.() : null);
     root.updateMatrixWorld(true);
     const localHand = (side) => root.worldToLocal(vrm.humanoid.getRawBoneNode(`${side}Hand`).getWorldPosition(new THREE.Vector3())).toArray();
-    const anchors = { ...props?.getAnchors(root), restLeft: localHand('left'), restRight: localHand('right') };
+    const bodyGroundOffset = footPlacement.supported ? footPlacement.surfaceHeight - .002 : 0;
+    const anchors = { ...props?.getAnchors(root, cupSnapshot), restLeft: localHand('left'), restRight: localHand('right'),
+      cupSip: [0, .550 + bodyGroundOffset, .116], cupSupport: [.08, .505 + bodyGroundOffset, .17] };
     const state = createActivityState(name, { durationSeconds, anchors });
     let finish, begin;
     const finished = new Promise((resolve) => { finish = resolve; });
     const started = new Promise((resolve) => { begin = resolve; });
-    activity = { id: ++activitySequence, name, state, props, finish, begin, finished, started, begun: false, frame: sampleActivity(state), handErrors: {} };
+    activity = { id: ++activitySequence, name, state, props, finish, begin, finished, started, begun: false, frame: sampleActivity(state), handErrors: {},
+      cupTransaction, cupHome: cupSnapshot?.home, blocked: false, returnFailure: false };
+    face.cancelResponseCue();
     setGesture('none');
     return { id: activity.id, started, finished };
   }
 
   function cancelActivity() {
     if (!activity) return Promise.resolve(activityResult ?? { status: 'idle' });
+    if (activity.blocked) return activity.finished;
     if (!activity.state.cancelling) {
-      activity.state = cancelActivityState(activity.state, { holdingProp: activity.name === 'drink' && activity.props?.isCupHeld() });
+      if (activity.cupTransaction) activity.props.requestCupReturn(activity.cupTransaction);
+      activity.state = cancelActivityState(activity.state, { holdingProp: ['drink', 'move_cup'].includes(activity.name) && activity.props?.isCupHeld() });
       if (!activity.begun) activity.begin(false);
     }
     return activity.finished;
@@ -211,6 +247,13 @@ export async function createAvatar(scene) {
     const dt = clamp(rawDt, 0, 0.05);
     time += dt;
     const speed = Math.max(0, Number(context.speed) || 0);
+    lastSpeed = speed;
+    lastRenderVisible = context.renderVisible !== false;
+    lastCueEnabled = context.attentionCueEnabled !== false;
+    const rootMoved = root.position.distanceToSquared(previousRootPosition) > 1e-10;
+    const rootTurned = Math.abs(Math.atan2(Math.sin(root.rotation.y - previousRootYaw), Math.cos(root.rotation.y - previousRootYaw))) > .0001;
+    previousRootPosition.copy(root.position); previousRootYaw = root.rotation.y;
+    const previousSitBlend = sitBlend;
     const desiredSit = Number.isFinite(context.sitBlend)
       ? clamp(context.sitBlend, 0, 1)
       : (context.seated ? 1 : 0);
@@ -218,12 +261,13 @@ export async function createAvatar(scene) {
       ? desiredSit
       : damp(sitBlend, desiredSit, 4.3, dt);
     locomotion = stepGait(locomotion, dt, { speed, sitBlend, direction: context.walkDirection });
-    if (activity) {
-      activity.state = stepActivity(activity.state, dt);
+    if (activity && !activity.blocked) {
+      activity.state = stepActivity(activity.state, dt, { pageTurnAllowed: context.pageTurnAllowed });
       activity.frame = sampleActivity(activity.state);
     }
     const activityFrame = activity?.frame;
-    const facial = face.update(dt, { moving: speed > 0.03 });
+    const responseCueAllowed = canUseResponseCue() && !rootMoved && !rootTurned && Math.abs(sitBlend - previousSitBlend) < .00001;
+    const facial = face.update(dt, { moving: speed > 0.03, responseCueAllowed });
     const breath = Math.sin(time * 1.65);
     const seated = sitBlend;
     const standing = 1 - seated;
@@ -241,16 +285,17 @@ export async function createAvatar(scene) {
     // This translation is in the avatar's local space; the room owns root.y.
     vrm.scene.position.y = floorOffset - sitDrop * seated;
     pose('hips', 0.015 * seated, locomotion.hipYaw, locomotion.hipRoll, 10, dt);
+    const footPose = footPlacement.update(dt, { sitBlend: seated, time, groundHeightAt: context.groundHeightAt });
     pose('spine', -0.025 + 0.035 * seated + breath * 0.008 + (activityFrame?.spineLean ?? 0), 0, Math.sin(time * 0.7) * 0.006 * standing, 10, dt);
-    pose('chest', breath * 0.009 + (activityFrame?.chestLean ?? 0), locomotion.chestYaw, 0, 10, dt);
+    pose('chest', breath * 0.009 + (activityFrame?.chestLean ?? 0), THREE.MathUtils.lerp(locomotion.chestYaw, footPose.chestYaw, footPose.weight), 0, 10, dt);
     pose('upperChest', 0, 0, 0, 10, dt);
     pose('leftShoulder', 0, 0, -0.025, 10, dt);
     pose('rightShoulder', 0, 0, 0.025, 10, dt);
 
     // The normalised skeleton has a T-pose. These Z rotations lower the arms;
     // mild elbow flexion and separated hands avoid intersecting the clothing.
-    let leftArmX = locomotion.leftArm - 0.16 * seated;
-    let rightArmX = locomotion.rightArm - 0.16 * seated;
+    let leftArmX = THREE.MathUtils.lerp(locomotion.leftArm, footPose.armSwing, footPose.weight) - 0.16 * seated;
+    let rightArmX = THREE.MathUtils.lerp(locomotion.rightArm, -footPose.armSwing, footPose.weight) - 0.16 * seated;
     let leftArmZ = -1.22 + 0.06 * seated;
     let rightArmZ = 1.22 - 0.06 * seated;
     let rightElbowY = 0.16;
@@ -304,11 +349,27 @@ export async function createAvatar(scene) {
     if (activityFrame?.lookAt && (activity?.name !== 'read' || !context.lookTarget?.isVector3)) {
       activityLookTarget.fromArray(activityFrame.lookAt); root.localToWorld(activityLookTarget); lookTarget = activityLookTarget;
     }
+    const bookTarget = activity?.props?.lookTargets?.book;
+    const readingLayout = activity?.name === 'read' ? activity.props?.getReadingGazeLayout?.() : null;
+    readingGaze = stepReadingGaze(readingGaze, dt, {
+      enabled: context.readAlongPage === true && context.renderVisible !== false && activity?.name === 'read'
+        && (!context.lookTarget?.isVector3 || (bookTarget?.isVector3 && context.lookTarget.distanceTo(bookTarget) <= .05)),
+      phase: activityFrame?.phase, cancelling: activityFrame?.cancelling,
+      lineCount: readingLayout?.lineCount, pageKey: readingLayout?.pageKey, episodeKey: activity?.id,
+    });
+    let eyeLookTarget = lookTarget;
+    if (readingGaze.active) {
+      const target = activity.props.getReadingGazeTarget(readingGaze, readingEyeTarget);
+      if (target) {
+        readingGazeLocal.copy(target); root.worldToLocal(readingGazeLocal);
+        eyeLookTarget = target;
+      } else readingGaze = stepReadingGaze(readingGaze, 0, { episodeKey: activity?.id, pageKey: readingLayout?.pageKey });
+    }
     if (lookTarget?.isVector3) {
       root.updateMatrixWorld(true);
       localTarget.copy(lookTarget);
       root.worldToLocal(localTarget);
-      const headY = eyeHeight - sitDrop * seated;
+      const headY = eyeHeight - sitDrop * seated + (footPlacement.supported ? footPlacement.weight * (footPlacement.surfaceHeight - .002) : 0);
       const yawLimit = activity?.name === 'read' ? 0.42 : 0.55;
       targetYaw = clamp(Math.atan2(localTarget.x, localTarget.z), -yawLimit, yawLimit);
       const pitchLimit = activityFrame?.pitchLimit ?? 0.2;
@@ -317,17 +378,19 @@ export async function createAvatar(scene) {
     yaw = damp(yaw, targetYaw + facial.gazeYaw * 0.35, 4, dt);
     pitch = damp(pitch, targetPitch + facial.gazePitch * 0.3, 4, dt);
     pose('neck', pitch * 0.3, yaw * 0.35, 0, 8, dt);
-    pose('head', pitch * 0.7 + nod, yaw * 0.65, Math.sin(time * 0.55) * 0.006 + facial.headTilt, 8, dt);
+    pose('head', pitch * 0.7 + nod + facial.responseCuePitch, yaw * 0.65, Math.sin(time * 0.55) * 0.006 + facial.headTilt, 8, dt);
 
     // Update the actual head transform before calculating residual eye gaze.
     // Otherwise lookAt uses last frame's pose and fights the moving head.
     vrm.humanoid.update();
     vrm.scene.updateMatrixWorld(true);
     if (vrm.lookAt) {
-      if (lookTarget?.isVector3) vrm.lookAt.lookAt(lookTarget);
+      // Paper scanning belongs to the eyes only. Keep the original head target
+      // and supported hands unchanged, including explicit glances at the user.
+      if (eyeLookTarget?.isVector3) vrm.lookAt.lookAt(eyeLookTarget);
       else vrm.lookAt.reset();
-      const desiredEyeYaw = clamp(vrm.lookAt.yaw + THREE.MathUtils.RAD2DEG * facial.gazeYaw * 3, -65, 65);
-      const desiredEyePitch = clamp(vrm.lookAt.pitch + THREE.MathUtils.RAD2DEG * facial.gazePitch * 3, -35, 35);
+      const desiredEyeYaw = clamp(vrm.lookAt.yaw + (readingGaze.active ? 0 : THREE.MathUtils.RAD2DEG * facial.gazeYaw * 3), -65, 65);
+      const desiredEyePitch = clamp(vrm.lookAt.pitch + (readingGaze.active ? 0 : THREE.MathUtils.RAD2DEG * facial.gazePitch * 3), -35, 35);
       eyeYaw = damp(eyeYaw, desiredEyeYaw, 14, dt);
       eyePitch = damp(eyePitch, desiredEyePitch, 14, dt);
       vrm.lookAt.yaw = eyeYaw;
@@ -353,18 +416,42 @@ export async function createAvatar(scene) {
       vrm.scene.updateMatrixWorld(true);
       const current = activity, frame = current.frame, props = current.props;
       if (current.name === 'read') props.updateBook(frame.bookOpen, frame.pageFlip);
-      if (current.name === 'drink') {
+      if (current.name === 'drink' || current.name === 'move_cup') {
         const handMatrix = vrm.humanoid.getRawBoneNode('rightHand').matrixWorld;
-        if (frame.shouldHoldCup && !props.isCupHeld()) props.attachCup(handMatrix);
+        if (frame.shouldHoldCup && !props.isCupHeld() && !current.cupTransaction?.deposited) props.attachCup(handMatrix);
         if (props.isCupHeld()) props.updateHeldCup(handMatrix);
-        if (!frame.shouldHoldCup && props.isCupHeld()) props.releaseCup();
+        if (!frame.shouldHoldCup && props.isCupHeld()) {
+          if (current.name === 'drink') props.releaseCup();
+          else if (!props.tryCupDeposit(current.cupTransaction)) {
+            if (!current.cupTransaction.returning) {
+              props.requestCupReturn(current.cupTransaction);current.returnFailure = true;
+              current.state = cancelActivityState(current.state, { holdingProp: true });
+              current.frame = sampleActivity(current.state);
+            } else {
+              // Never drop an unsupported cup merely to settle the promise.
+              // The room can observe held+blocked and prevent leaving the table.
+              current.blocked = true;props.blockCupTransfer(current.cupTransaction);
+              current.frame = { ...frame, phase: 'holding-cup', done: false, shouldHoldCup: true, rightWeight: 1, rightCurl: .32 };
+              activityResult = { id: current.id, name: current.name, status: 'failed', code: 'CUP_RETURN_BLOCKED',
+                placement: props.getCupPlacement(current.cupTransaction), effect: null };
+              if (!current.begun) current.begin(false);
+              current.finish(activityResult);
+            }
+            return;
+          }
+        }
       }
       if (frame.started && !frame.cancelling && !current.begun) { current.begun = true; current.begin(true); }
       if (frame.done) {
         if (!current.begun) current.begin(false);
-        const placement = current.name === 'drink' ? props.getCupReturnError() : null;
-        const status = frame.cancelling ? 'cancelled' : placement && (placement.position > 0.025 || placement.angle > 0.2) ? 'failed' : 'completed';
-        activityResult = { id: current.id, name: current.name, status, placement };
+        const placement = current.cupTransaction ? props.getCupPlacement(current.cupTransaction)
+          : current.name === 'drink' ? props.getCupReturnError(current.cupHome) : null;
+        const failed = current.returnFailure || (current.cupTransaction ? !placement.supported : placement && (placement.position > .025 || placement.angle > .2));
+        const status = current.cupTransaction ? (failed ? 'failed' : frame.cancelling ? 'cancelled' : 'completed')
+          : frame.cancelling ? 'cancelled' : failed ? 'failed' : 'completed';
+        activityResult = { id: current.id, name: current.name, status, placement,
+          ...(current.cupTransaction ? { effect: current.cupTransaction.effect } : {}) };
+        if (current.cupTransaction) props.finishCupTransfer(current.cupTransaction);
         activity = null;
         current.finish(activityResult);
       }
@@ -389,22 +476,29 @@ export async function createAvatar(scene) {
     thighLength,
     seatHeight: seatSurfaceHeight,
     seatedHipHeight,
-    preferredWalkSpeed: GAIT.nominalSpeed,
+    preferredWalkSpeed: footPlacement.supported ? FOOT_PLACEMENT.speed : GAIT.nominalSpeed,
+    preferredTurnSpeed: footPlacement.supported ? FOOT_PLACEMENT.turnSpeed : 3.8,
+    get groundOffset() { return footPlacement.supported ? footPlacement.weight * (footPlacement.surfaceHeight - .002) : 0; },
     sitDrop,
+    cupTransferSupported,
     expressions: [...EXPRESSIONS],
     update,
     setExpression: face.setExpression,
-    setAttention: face.setAttention,
+    setAttention,
     setSpeaking: face.setSpeaking,
     setGesture,
     setActivity,
     cancelActivity,
     getState() { return { ...face.getState(), gesture, seated: sitBlend > 0.95, sitBlend, walkBlend: locomotion.blend, gaitPhase: locomotion.phase, gaze: { yaw: eyeYaw, pitch: eyePitch }, facialRig: facialRig.supported,
-      activity: activity ? { id: activity.id, name: activity.name, phase: activity.frame.phase, elapsed: activity.state.elapsed, cancelling: activity.state.cancelling, holdingProp: activity.name === 'drink' && activity.props?.isCupHeld(), handErrors: { ...activity.handErrors } } : null,
-      activityResult,
+      activity: activity ? { id: activity.id, name: activity.name, phase: activity.frame.phase, elapsed: activity.state.elapsed, cancelling: activity.state.cancelling,
+        blocked: activity.blocked, holdingProp: ['drink', 'move_cup'].includes(activity.name) && activity.props?.isCupHeld(), handErrors: { ...activity.handErrors } } : null,
+      activityResult, get footPlacement() { return footPlacement.getState(); }, tailGround: tailGroundRig.getState(),
+      get readingGaze() { return { active: readingGaze.active, scanning: readingGaze.scanning, line: readingGaze.line,
+        fixation: readingGaze.fixation, targetLocal: readingGaze.active ? readingGazeLocal.toArray() : null }; },
     }; },
     dispose() {
       isDisposed = true;
+      tailGroundRig.dispose();
       root.removeFromParent();
       VRMUtils.deepDispose(vrm.scene);
     },

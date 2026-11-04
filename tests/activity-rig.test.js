@@ -92,13 +92,17 @@ function cupFaceDepth(avatar, props) {
   return maxDepth;
 }
 
-test('actual avatar carries one cup continuously and returns it to the coaster', { skip: localModelSkip }, async (t) => {
-  const { avatar, props } = await avatarFixture(); enterStation(avatar, props, 'drink');
+for (const floorHeight of [.0025, .0285]) test(`actual avatar carries one cup continuously on floor ${floorHeight} and returns it to the coaster`, { skip: localModelSkip }, async (t) => {
+  const { avatar, props } = await avatarFixture();
+  const update = avatar.update; avatar.update = (dt, context = {}) => update(dt, { ...context, groundHeightAt: () => floorHeight });
+  enterStation(avatar, props, 'drink');
   const initial = props.cup.getWorldPosition(new THREE.Vector3());
   const handle = avatar.setActivity('drink', { props }); assert.ok(handle);
   let previous = initial.clone(), maxJump = 0, maxHandError = 0, moved = false, mouthGap = Infinity, maxFaceDepth = 0;
   for (let i = 0; i < 9 * 60; i++) {
+    if (i === 210) avatar.setAttention('responding');
     avatar.update(1 / 60);
+    assert.equal(avatar.getState().responseCuePitch, 0, 'a text response during drinking must not lower the head into the cup');
     const current = props.cup.getWorldPosition(new THREE.Vector3());
     maxJump = Math.max(maxJump, previous.distanceTo(current));
     if (current.distanceTo(initial) > .1) moved = true;
@@ -136,8 +140,10 @@ test('actual avatar carries one cup continuously and returns it to the coaster',
   assert.ok(maxFaceDepth < .003, `the cup body and handle must stay outside the face envelope: ${maxFaceDepth}`);
 });
 
-test('actual reading fingertips reach the open page and an interrupted read closes cleanly', { skip: localModelSkip }, async () => {
-  const { avatar, props } = await avatarFixture(); enterStation(avatar, props, 'read');
+for (const floorHeight of [.0025, .0285]) test(`actual reading fingertips reach the page on floor ${floorHeight} and an interrupted read closes cleanly`, { skip: localModelSkip }, async () => {
+  const { avatar, props } = await avatarFixture();
+  const update = avatar.update; avatar.update = (dt, context = {}) => update(dt, { ...context, groundHeightAt: () => floorHeight });
+  enterStation(avatar, props, 'read');
   const handle = avatar.setActivity('read', { props }); assert.ok(handle);
   for (let i = 0; i < 5 * 60; i++) avatar.update(1 / 60);
   assert.equal(await handle.started, true);
@@ -159,7 +165,9 @@ test('actual reading fingertips reach the open page and an interrupted read clos
   const headBefore = head.getWorldQuaternion(new THREE.Quaternion());
   const handBefore = avatar.vrm.humanoid.getRawBoneNode('rightHand').getWorldPosition(new THREE.Vector3());
   const userTarget = avatar.root.localToWorld(new THREE.Vector3(.8, 1.05, 2));
+  avatar.setAttention('responding');
   for (let i = 0; i < 60; i++) avatar.update(1 / 60, { lookTarget: userTarget });
+  assert.equal(avatar.getState().responseCuePitch, 0, 'reading retains its own head and hand pose during a response');
   assert.ok(headBefore.angleTo(head.getWorldQuaternion(new THREE.Quaternion())) > .15, 'reading must permit a real head glance toward the supplied user target');
   assert.ok(handBefore.distanceTo(avatar.vrm.humanoid.getRawBoneNode('rightHand').getWorldPosition(new THREE.Vector3())) < .001, 'looking up must not move the supported hand off the page');
   const exit = avatar.cancelActivity();

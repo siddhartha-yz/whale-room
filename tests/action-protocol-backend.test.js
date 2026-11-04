@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once, EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { readFileSync } from 'node:fs';
 import { createApp } from '../server/index.js';
 import { validateReply, validateAutonomyReply, validateAutonomyRequest, runCompanion } from '../server/companion.js';
+import { ROOM_ACTION_TYPES, ROOM_TARGET_TYPES, MAX_ROOM_ACTIONS } from '../shared/room-actions.js';
 
 const reading = { id: 'reading-one', kind: 'read', phase: 'reading', cancelling: false };
 const currentActivity = { id: reading.id, activity: '在桌边看书', phase: 'ready', startedAt: Date.now() - 120_000,
@@ -13,6 +15,15 @@ const breakingActions = [
   { type: 'move_to', target: 'window' }, { type: 'sit', target: 'sofa' },
   ...['stand', 'drink', 'stretch', 'wave', 'nod'].map(type => ({ type, target: 'none' })),
 ];
+
+test('the CLI schemas advertise the same action vocabulary and limits as the client and server validator', () => {
+  for (const file of ['response-schema.json', 'autonomy-schema.json']) {
+    const { properties } = JSON.parse(readFileSync(new URL(`../server/${file}`, import.meta.url), 'utf8'));
+    assert.equal(properties.actions.maxItems, MAX_ROOM_ACTIONS);
+    assert.deepEqual(new Set(properties.actions.items.properties.type.enum), new Set(ROOM_ACTION_TYPES));
+    assert.deepEqual(new Set(properties.actions.items.properties.target.enum), new Set(ROOM_TARGET_TYPES));
+  }
+});
 
 test('look_at requires a real room target in both chat and autonomous results', () => {
   for (const target of ['sofa', 'window', 'plant', 'center', 'user']) {
