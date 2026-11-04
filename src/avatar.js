@@ -65,6 +65,8 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
   boneNames.push(...fingerNames);
   const bones = Object.fromEntries(boneNames.map((name) => [name, vrm.humanoid.getNormalizedBoneNode(name)]));
   const rest = Object.fromEntries(boneNames.map((name) => [name, bones[name]?.quaternion.clone()]));
+  const armLayerNames = ['leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm', 'leftHand', 'rightHand'];
+  const armBase = Object.fromEntries(armLayerNames.map(name => [name, bones[name]?.quaternion.clone()]));
   const hipRest = bones.hips.position.clone();
   const upperLegPoint = bones.leftUpperLeg.getWorldPosition(new THREE.Vector3());
   const kneePoint = bones.leftLowerLeg.getWorldPosition(new THREE.Vector3());
@@ -118,6 +120,8 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
   const readingEyeTarget = new THREE.Vector3(), readingGazeLocal = new THREE.Vector3();
   let readingGaze = stepReadingGaze(null, 0);
   const ik = {
+    baseUpper: new THREE.Quaternion(), baseLower: new THREE.Quaternion(), baseHand: new THREE.Quaternion(),
+    solved: new THREE.Quaternion(),
     shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), wrist: new THREE.Vector3(),
     target: new THREE.Vector3(), direction: new THREE.Vector3(), pole: new THREE.Vector3(),
     desiredElbow: new THREE.Vector3(), currentDirection: new THREE.Vector3(), wantedDirection: new THREE.Vector3(),
@@ -200,6 +204,7 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
     const upper = bones[`${side}UpperArm`], lower = bones[`${side}LowerArm`], hand = bones[`${side}Hand`];
     root.updateMatrixWorld(true);
     upper.getWorldPosition(ik.shoulder); lower.getWorldPosition(ik.elbow); hand.getWorldPosition(ik.wrist);
+    ik.baseUpper.copy(upper.quaternion); ik.baseLower.copy(lower.quaternion); ik.baseHand.copy(hand.quaternion);
     const upperLength = ik.shoulder.distanceTo(ik.elbow), lowerLength = ik.elbow.distanceTo(ik.wrist);
     ik.target.fromArray(localPosition); root.localToWorld(ik.target);
     ik.direction.copy(ik.target).sub(ik.shoulder);
@@ -222,7 +227,7 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
       bone.getWorldQuaternion(ik.worldQuaternion);
       bone.parent.getWorldQuaternion(ik.parentQuaternion).invert();
       ik.desiredQuaternion.copy(ik.deltaQuaternion).multiply(ik.worldQuaternion).premultiply(ik.parentQuaternion);
-      bone.quaternion.slerp(ik.desiredQuaternion, weight);
+      bone.quaternion.copy(ik.desiredQuaternion);
       root.updateMatrixWorld(true);
     };
     ik.currentDirection.copy(ik.elbow).sub(ik.shoulder);
@@ -236,7 +241,12 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
     ik.orientation.setFromEuler(scratchEuler.set(tilt, side === 'left' ? -Math.PI / 2 : Math.PI / 2, 0, 'XYZ'));
     hand.parent.getWorldQuaternion(ik.parentQuaternion).invert();
     ik.desiredQuaternion.copy(ik.rootQuaternion).multiply(ik.orientation).premultiply(ik.parentQuaternion);
-    hand.quaternion.slerp(ik.desiredQuaternion, weight);
+    hand.quaternion.copy(ik.desiredQuaternion);
+    // Solve the complete chain before applying its layer weight. Solving the
+    // forearm against an already-partially-blended upper arm bends the exit.
+    ik.solved.copy(upper.quaternion); upper.quaternion.copy(ik.baseUpper).slerp(ik.solved, weight);
+    ik.solved.copy(lower.quaternion); lower.quaternion.copy(ik.baseLower).slerp(ik.solved, weight);
+    ik.solved.copy(hand.quaternion); hand.quaternion.copy(ik.baseHand).slerp(ik.solved, weight);
     root.updateMatrixWorld(true);
     hand.getWorldPosition(ik.wrist);
     return ik.wrist.distanceTo(ik.target);
@@ -324,12 +334,16 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
       nod = Math.sin(gestureAge * 8.5) * 0.16 * envelope;
       if (gestureAge > 1.5) gesture = null;
     }
+    // Animate an independent base pose, not the previous frame's IK result.
+    // Otherwise uneven frame lengths feed the reach back into the resting pose.
+    for (const name of armLayerNames) if (bones[name]) bones[name].quaternion.copy(armBase[name]);
     pose('leftUpperArm', leftArmX, 0, leftArmZ, 11, dt);
     pose('rightUpperArm', rightArmX, 0, rightArmZ, 11, dt);
     pose('leftLowerArm', 0, -0.16 - seated * 0.55, 0, 11, dt);
     pose('rightLowerArm', 0, rightElbowY + seated * 0.55, rightElbowZ, 11, dt);
     pose('leftHand', 0.05, 0, -0.04, 11, dt);
     pose('rightHand', 0.05, 0, 0.04 + rightHandZ, 11, dt);
+    for (const name of armLayerNames) if (bones[name]) armBase[name].copy(bones[name].quaternion);
     for (const name of fingerNames) {
       const side = name.startsWith('left') ? 'left' : 'right';
       const curl = activityFrame?.[`${side}Curl`] ?? 0;
