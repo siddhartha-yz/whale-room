@@ -28,6 +28,32 @@ export function createBookcaseBooks(parent) {
   });
 }
 
+// The plant is static and opaque. Batch only identical leaf meshes, retaining
+// their original geometry, UVs, materials, rotations and non-uniform scales.
+export function createTallPlantLeaves(parent) {
+  const geometry = new THREE.SphereGeometry(1, 16, 12);
+  const transform = new THREE.Object3D();
+  return ['#5c7c4e', '#7c9565'].map((color, variant) => {
+    const indices = Array.from({ length: variant ? 5 : 6 }, (_, index) => index * 2 + variant);
+    const leaves = new THREE.InstancedMesh(geometry, mat(color), indices.length);
+    leaves.name = `TallPlantLeaves${variant}`;
+    indices.forEach((index, instance) => {
+      const angle = index * 2.4, height = .7 + (index % 4) * .21;
+      transform.scale.set(.13, .29, .04);
+      transform.position.set(3.03 + Math.cos(angle) * .25, .6 + height, -2.47 + Math.sin(angle) * .25);
+      transform.rotation.set(.5 + Math.sin(angle) * .8, angle, Math.cos(angle) * .8);
+      transform.updateMatrix();
+      leaves.setMatrixAt(instance, transform.matrix);
+    });
+    leaves.instanceMatrix.needsUpdate = true;
+    leaves.castShadow = true;
+    leaves.receiveShadow = false;
+    leaves.computeBoundingBox(); leaves.computeBoundingSphere();
+    parent.add(leaves);
+    return leaves;
+  });
+}
+
 export function createRoom(container) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#e9e5da');
@@ -173,9 +199,8 @@ export function createRoom(container) {
     const angle=i*2.4, height=.7+(i%4)*.21;
     const stem=cylinder(.012,.018,height,stemMat,3.03+Math.cos(angle)*.07,.42+height/2,-2.47+Math.sin(angle)*.06,8);
     stem.rotation.z=Math.cos(angle)*.14;stem.rotation.x=Math.sin(angle)*.14;
-    const leaf=new THREE.Mesh(new THREE.SphereGeometry(1,16,12),mat(i%2?'#7c9565':'#5c7c4e'));
-    leaf.scale.set(.13,.29,.04);leaf.position.set(3.03+Math.cos(angle)*.25,.6+height,-2.47+Math.sin(angle)*.25);leaf.rotation.set(.5+Math.sin(angle)*.8,angle,Math.cos(angle)*.8);leaf.castShadow=true;scene.add(leaf);
   }
+  createTallPlantLeaves(scene);
   // Original minimal wall art.
   function art(x,y,z,w,h,variant){
     box(w+.1,h+.1,.055,walnut,x,y,z);
