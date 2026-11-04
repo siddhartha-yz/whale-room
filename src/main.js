@@ -394,10 +394,10 @@ function observedReading(){
 }
 function worldState(){
   const cup=currentCup();
-  const availableActivities=avatar.supportedActivities.filter(activity=>activity!=='move_cup'||cup?.supported&&!cup.blocked);
+  const availableActivities=cup?.blocked?[]:avatar.supportedActivities.filter(activity=>activity!=='move_cup'||cup?.supported);
   return {position:{x:+avatar.root.position.x.toFixed(2),z:+avatar.root.position.z.toFixed(2)},posture:state.mode,expression:state.expression,location:state.place,gaze:currentLook,activity:activityState(),reading:observedReading(),
     ...(cup?.supported?{cup:{...cup,supported:!cup.blocked}}:{}),availableTargets:Object.entries(places).map(([id,p])=>({id,name:p.label,x:p.x,z:p.z})),availableActivities,
-    avatarModel:avatar.usingFallback?'pixiv-sample':'local-whale',room:'客厅，有沙发、茶几、窗户、绿植、书柜和窗边小桌。可用活动以 availableActivities 为准；没有室外移动、做饭或任意拿取物品技能。'};
+    avatarModel:avatar.usingFallback?'pixiv-sample':avatar.tabletopSupported?'local-whale':'replacement-vrm',room:'客厅，有沙发、茶几、窗户、绿植、书柜和窗边小桌。可用活动以 availableActivities 为准；没有室外移动、做饭或任意拿取物品技能。'};
 }
 function chatWorldState(){
   const world=worldState();
@@ -896,6 +896,8 @@ async function init(){
     if(cupShift&&avatar.cupTransferSupported)room.activities?.enableCupTransfer?.();
     if(avatar.usingFallback){
       $('#avatar-note').hidden=false;$('#avatar-source').href='/assets/ATTRIBUTION-pixiv.txt';$('#avatar-author').textContent='pixiv';
+    }else if(!avatar.tabletopSupported){
+      $('#avatar-note').hidden=false;$('#avatar-note').textContent='当前角色还没适配看书和拿杯。';$('#avatar-author').textContent='本地 VRM';
     }
     for(const button of document.querySelectorAll('[data-action="read"], [data-action="drink"], [data-action="stretch"]')){
       button.disabled=!avatar.supportedActivities.includes(button.dataset.action);

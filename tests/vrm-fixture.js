@@ -85,7 +85,7 @@ export function loadLocalVrmFixture(sourceUrl = modelUrl) {
     for (const bind of definition.morphTargetBinds ?? []) expression.addBind(new VRMExpressionMorphTargetBind({ primitives: meshNodes.get(bind.node), index: bind.index, weight: bind.weight }));
     expressionManager.registerExpression(expression);
   }
-  const vrm = { scene, humanoid, expressionManager, meta: { metaVersion: '1' },
+  const vrm = { scene, humanoid, expressionManager, meta: { ...json.extensions.VRMC_vrm.meta, metaVersion: '1' },
     update() { humanoid.update(); expressionManager.update(); },
   };
   return { scene, userData: { vrm } };

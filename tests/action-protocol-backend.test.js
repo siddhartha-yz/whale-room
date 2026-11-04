@@ -38,6 +38,22 @@ test('look_at requires a real room target in both chat and autonomous results', 
   }
 });
 
+test('uncalibrated avatars cannot advertise a book or cup action through either model channel', () => {
+  for (const world of [{ avatarModel: 'pixiv-sample' }, { avatarModel: 'replacement-vrm' }, { availableActivities: ['stretch'] }]) {
+    const direct = actions => validateReply({ reply: '嗯。', expression: 'neutral', actions }, { world });
+    for (const type of ['read', 'drink']) {
+      const actions = [{ type, target: 'none' }];
+      assert.throws(() => direct(actions), { code: 'INVALID_MODEL_OUTPUT' });
+      assert.throws(() => validateAutonomyReply({ ...plan, continuationOf: null, actions }, { world }), { code: 'INVALID_MODEL_OUTPUT' });
+      const optional = { ...plan, continuationOf: null, nextIntent: { activity: '到桌边', reason: '另做一件事', actions, dwellSeconds: 60, after: 'dwell' } };
+      assert.equal(validateAutonomyReply(optional, { world }).nextIntent, null);
+    }
+    assert.deepEqual(direct([{ type: 'stretch', target: 'none' }]).actions, [{ type: 'stretch', target: 'none' }]);
+  }
+  const blocked = { cup: { supported: false, spot: 'cup_inner', held: true, blocked: true }, availableActivities: [] };
+  assert.throws(() => validateReply({ reply: '嗯。', expression: 'neutral', actions: [{ type: 'sit', target: 'sofa' }] }, { world: blocked }), { code: 'INVALID_MODEL_OUTPUT' });
+});
+
 test('an observed reading continuation cannot execute actions that end reading', () => {
   for (const phase of ['reading', 'turning-page']) {
     const options = { currentActivity, world: { activity: { ...reading, phase } } };

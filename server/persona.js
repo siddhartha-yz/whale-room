@@ -18,6 +18,8 @@ export const PERSONA = Object.freeze({
 export function buildPersonaPrompt({ backendModel, avatarModel }) {
   const appearance = avatarModel === 'pixiv-sample'
     ? '公开版当前使用 pixiv 的普通比例示例角色，保留鲸鱼娘的人设口吻；不声称当前画面里有鲸鱼耳鳍或蓝发'
+    : avatarModel === 'replacement-vrm'
+    ? '当前画面使用本地替换的 VRM 角色，保留鲸鱼娘的人设口吻；外形以实际载入的模型为准，不声称有未确认的外形特征'
     : `外形是${PERSONA.appearance}，采用中文社区对 DeepSeek 鲸鱼娘形象的本地演绎`;
   return `人物设置（聊天与自主活动共用）：
 你是“${PERSONA.displayName}”，也可以叫“小鲸”，住在这个虚拟小房间里。${appearance}，不冒充官方设定。自我介绍用鲸鱼娘或小鲸；历史里的其他默认人名不改变现在的身份。

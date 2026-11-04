@@ -114,17 +114,19 @@ export function validateAutonomyRequest(body) {
 
 function canMoveCup(world) {
   const cup = world?.cup;
-  return Boolean(cup && typeof cup === 'object' && !Array.isArray(cup)
+  return Boolean(tabletopAvailable(world) && cup && typeof cup === 'object' && !Array.isArray(cup)
     && cup.supported === true && cup.blocked !== true && CUP_SPOTS.includes(cup.spot)
     && typeof cup.held === 'boolean');
 }
 
 function tabletopAvailable(world) {
-  return world?.avatarModel !== 'pixiv-sample' && world?.cup?.blocked !== true;
+  return !['pixiv-sample', 'replacement-vrm'].includes(world?.avatarModel) && world?.cup?.blocked !== true
+    && (!Array.isArray(world?.availableActivities) || ['read', 'drink'].every(type => world.availableActivities.includes(type)));
 }
 
 function tabletopRestriction(world) {
   if (tabletopAvailable(world)) return '';
+  if (world?.cup?.blocked === true) return '\n- 杯子仍在手上，暂时不能安全放回。角色应停在桌边，actions 只可留空或改变视线。';
   return '\n- 当前角色不能执行 read 或 drink。即使协议中有这些枚举，也不要输出这两项或承诺执行；按 availableActivities 选择。';
 }
 
@@ -141,6 +143,9 @@ function validateActions(actions, { world } = {}) {
   }
   if (!isRoomActionList(actions)) {
     throw new CompanionError('Astra 返回了不支持的动作，请重试。', 'INVALID_MODEL_OUTPUT');
+  }
+  if (world?.cup?.blocked === true && actions.some(action => action.type !== 'look_at')) {
+    throw new CompanionError('杯子仍拿在手里，暂时不能离开桌边。', 'INVALID_MODEL_OUTPUT');
   }
   if (actions.some(action => action.type === 'move_cup') && !canMoveCup(world)) {
     throw new CompanionError('当前房间尚不支持搬动杯子，请重试。', 'INVALID_MODEL_OUTPUT');

@@ -86,11 +86,12 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
   const sitDrop = hipHeight - seatedHipHeight;
   const footPlacement = createFootPlacement(vrm, root);
   const tailGroundRig = createTailGround(vrm, scene, { enabled: tailGround });
-  const cupTransferSupported = footPlacement.supported && vrm.meta?.metaVersion === '1'
+  const tabletopSupported = footPlacement.supported && vrm.meta?.metaVersion === '1'
     && vrm.meta.name === '蓝色小肥鱼Deepseek' && vrm.meta.authors?.length === 1 && vrm.meta.authors[0] === '木子恶魔';
-  // Prop reach targets are calibrated for the optional local chibi model.
-  const supportedActivities = Object.freeze(usingFallback ? ['stretch']
-    : ['read', 'drink', 'stretch', ...(cupTransferSupported ? ['move_cup'] : [])]);
+  const cupTransferSupported = tabletopSupported;
+  // A local filename alone does not prove the proportions used by these targets.
+  const supportedActivities = Object.freeze(tabletopSupported
+    ? ['read', 'drink', 'stretch', 'move_cup'] : ['stretch']);
 
   const scratchEuler = new THREE.Euler();
   const scratchQuaternion = new THREE.Quaternion();
@@ -483,6 +484,7 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
     modelSource,
     usingFallback,
     supportedActivities,
+    tabletopSupported,
     height,
     headHeight,
     eyeHeight,
