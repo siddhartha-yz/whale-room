@@ -54,7 +54,7 @@ const seatContactEnabled=!(inspectionMode&&roomParams.get('seatContactCurve')===
 const minimumFramingDistance=inspectionMode&&roomParams.get('cameraFraming')==='0'?0:1.1;
 const tailGround=inspectionMode&&roomParams.get('tailGround')==='1';
 const readAlongPage=inspectionMode&&roomParams.get('readAlongPage')==='1';
-const cupShift=inspectionMode&&roomParams.get('cupShift')==='1';
+const cupShift=!(inspectionMode&&roomParams.get('cupShift')==='0');
 const storeKey=inspectionMode?'room-companion-inspection-history-v1':'room-companion-history-v1';
 const autonomyStoreKey=inspectionMode?'room-inspection-autonomy-enabled':'room-autonomy-enabled';
 const activityClearKey=inspectionMode?'room-inspection-clear-activities':'room-clear-activities';
