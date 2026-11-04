@@ -224,6 +224,7 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
       requestCount: autonomy.requestCount,
       lastDecisionSpeechAllowed: autonomy.lastDecisionSpeechAllowed ?? null,
       recoveredQuietDwell: autonomy.recoveredQuietDwell === true,
+      peerActive: autonomy.peerActive === true,
       lastDecisionAt: autonomy.lastDecisionAt ?? null,
       ...(autonomy.nextIntent ? { nextIntent: autonomy.nextIntent } : {}),
       ...(autonomy.lastIntentEvent ? { lastIntentEvent: autonomy.lastIntentEvent } : {}),

@@ -10,6 +10,7 @@ import { createMemoryStore, proactivePreference } from './memory.js';
 import { installMemoryControls } from './memory-ui.js';
 import { createActivityJournal } from './activity-journal.js';
 import { createAutonomyOwner } from './autonomy-owner.js';
+import { createPeerActivity } from './peer-activity.js';
 import { createConversation } from './conversation.js';
 import { createConversationScope } from './conversation-scope.js';
 import { constrainRoomCamera, sampleCameraOrbit, resolveCameraOcclusion } from './camera.js';
@@ -65,6 +66,7 @@ let interactionStation=null;
 const TABLE_STAGING_Z=1.62;
 const settleWaiters=[];
 let currentLook='user', activityLookLease=null, speechTimer=null, speechVersion=0, initialized=false, busy=false, closeView=false;
+let speechOwner=null,peerActivity=null;
 let autonomy=null, actionOwner=null, providerAvailable=false;
 let autonomyOwner=null, pendingUserEvent=false, pendingConversation=false, pendingSpeech=false, pendingActivityClear=false;
 let quietDwellFrameGap=false, quietDwellRecovery=null;
@@ -203,7 +205,25 @@ function cancelActions({activityEnding=false}={}){
   if(!brakingMotion)state.speed=0;
   presence();actionOwner=null;flushSettleWaiters();
 }
-function stopSpeech(){speechVersion++;window.speechSynthesis?.cancel();clearTimeout(speechTimer);avatar?.setSpeaking(false);}
+function syncPeerBusy(){peerActivity?.setBusy(busy||composingMessage||speechOwner==='chat');}
+function peerIsActive(){return peerActivity?.isPeerActive()===true;}
+function stopSpeech({autonomousOnly=false}={}){
+  if(autonomousOnly&&speechOwner!=='autonomy')return;
+  speechVersion++;window.speechSynthesis?.cancel();clearTimeout(speechTimer);speechTimer=null;
+  speechOwner=null;avatar?.setSpeaking(false);syncPeerBusy();
+}
+function setupPeerActivity(){
+  if(peerActivity)return;
+  peerActivity=createPeerActivity({scope:inspectionMode?'inspection':'normal',onPeerActive:()=>{
+    discardQuietDwellRecovery();
+    if(actionOwner==='autonomy'||activityRun?.source==='autonomy')cancelActions();
+    stopSpeech({autonomousOnly:true});
+    if(autonomy)autonomy.notifyUser();
+    else pendingUserEvent=true;
+  }});
+  syncPeerBusy();
+}
+function releasePeerActivity(){peerActivity?.dispose();peerActivity=null;composingMessage=false;}
 function renderConnection(connection){
   providerAvailable=connection.available;
   const labels={preparing:'连接中…',ready:'Astra','needs-login':'需要登录 Codex',offline:'本地服务未连接','scene-only':'离线场景'};
@@ -215,6 +235,7 @@ function renderConnection(connection){
 }
 function userActivity({conversation=false,listening=false}={}){
   discardQuietDwellRecovery();
+  peerActivity?.pulse();
   if(listening)avatar?.setAttention?.('listening');
   lookAt('user');
   stopSpeech();
@@ -394,17 +415,28 @@ function chatWorldState(){
   };
   return world;
 }
-function setBusy(value){busy=value;if(value)avatar?.setAttention?.('thinking');else if(avatar?.getState().attention==='thinking')avatar.setAttention?.('idle');$('#thinking').hidden=!value;$('#send').disabled=value||!initialized||!conversationReady;$('#message-input').setAttribute('aria-busy',String(value));if(autonomy)renderAutonomyStatus(autonomy.getState());}
-function speak(text){
+function setBusy(value){busy=value;syncPeerBusy();if(value)avatar?.setAttention?.('thinking');else if(avatar?.getState().attention==='thinking')avatar.setAttention?.('idle');$('#thinking').hidden=!value;$('#send').disabled=value||!initialized||!conversationReady;$('#message-input').setAttribute('aria-busy',String(value));if(autonomy)renderAutonomyStatus(autonomy.getState());}
+function speak(text,source='chat'){
   stopSpeech();if(!roomIsActive()||!$('#voice').checked)return;
   if(!window.speechSynthesis){toast('当前浏览器不支持朗读，文字陪聊仍然可用。');return;}
   const voices=window.speechSynthesis.getVoices();
   const voice=voices.find(v=>v.localService&&v.lang.toLowerCase().startsWith('zh'));
   if(!voice){toast('浏览器没有可用的本地中文语音，暂时使用文字回复。');$('#voice').checked=false;return;}
   const utterance=new SpeechSynthesisUtterance(text),version=speechVersion;utterance.lang='zh-CN';utterance.voice=voice;utterance.rate=.96;
+  speechOwner=source;syncPeerBusy();
+  const finish=()=>{
+    if(version!==speechVersion)return;
+    clearTimeout(speechTimer);speechTimer=null;speechOwner=null;avatar?.setSpeaking(false);syncPeerBusy();
+  };
+  const watch=()=>{
+    if(version!==speechVersion)return;
+    if(!window.speechSynthesis.speaking&&!window.speechSynthesis.pending)finish();
+    else speechTimer=setTimeout(watch,1500);
+  };
   utterance.onstart=()=>{if(version===speechVersion)avatar.setSpeaking(true);};
-  utterance.onend=utterance.onerror=()=>{if(version===speechVersion)avatar.setSpeaking(false);};
-  window.speechSynthesis.speak(utterance);
+  utterance.onend=utterance.onerror=finish;
+  speechTimer=setTimeout(watch,1500);
+  try{window.speechSynthesis.speak(utterance);}catch{finish();}
 }
 async function send(text){
   text=text.trim();if(!text||!avatar||busy||!conversationReady||pageLeaving)return;
@@ -455,9 +487,9 @@ composer.addEventListener('keydown',e=>{
   if(e.key!=='Enter'||e.shiftKey||e.isComposing||composingMessage||e.keyCode===229)return;
   e.preventDefault();if(!e.repeat)send(composer.value);
 });
-composer.addEventListener('compositionstart',()=>{composingMessage=true;onDraftChange();});
-composer.addEventListener('compositionend',()=>{composingMessage=false;});
-composer.addEventListener('blur',()=>{composingMessage=false;});
+composer.addEventListener('compositionstart',()=>{composingMessage=true;syncPeerBusy();onDraftChange();});
+composer.addEventListener('compositionend',()=>{composingMessage=false;syncPeerBusy();});
+composer.addEventListener('blur',()=>{composingMessage=false;syncPeerBusy();});
 composer.addEventListener('input',onDraftChange);
 $('#stop').addEventListener('click',async()=>{
   interrupt();const token=actionVersion;
@@ -727,7 +759,7 @@ function adoptChatReading(){
   return tryAdoptChatReading({
     run:activityRun,actual:avatar?.getState().activity,autonomy,
     idle:!movement&&!brakingMotion&&!transition&&!turning&&!activityExit&&!actionOwner,
-    visible:roomIsActive(),typing:isTyping(),chatBusy:busy,
+    visible:roomIsActive(),typing:isTyping(),chatBusy:busy||peerIsActive(),
   });
 }
 function startOwnedAutonomy(){
@@ -743,7 +775,7 @@ function startOwnedAutonomy(){
         ready:initialized&&providerAvailable,
         idle:!movement&&!brakingMotion&&!transition&&!turning&&!activityExit&&!actionOwner&&!currentCup()?.blocked&&(!activityRun||activityRun.source==='autonomy'),
         visible:roomIsActive(),renderActive:renderPresence.getState().active,
-        typing:isTyping(),chatBusy:busy,
+        typing:isTyping(),chatBusy:busy||peerIsActive(),
         history:conversation.modelHistory(),world:avatar?worldState():{},feedback:[...feedback],
         memory:remembered,canSpeak:proactivePreference(remembered)!=='quiet',
       };
@@ -752,7 +784,7 @@ function startOwnedAutonomy(){
     onError:error=>{connectionStatus.markFailure(error);$('#autonomy-reason').textContent=error.message||'连接失败，请稍后重试。';},
     onPlan:async plan=>{
       if(plan.executionSource!=='planned-next')setExpression(plan.expression);
-      if(plan.reply){message('assistant',plan.reply,'proactive');remember('assistant',plan.reply);avatar.setAttention?.('responding');speak(plan.reply);}
+      if(plan.reply){message('assistant',plan.reply,'proactive');remember('assistant',plan.reply);avatar.setAttention?.('responding');speak(plan.reply,'autonomy');}
       if(plan.continuationOf&&plan.actions.length===0)return {status:'completed',feedback:[],activity:activityState()};
       return await runActions(plan.actions,{source:'autonomy',activityId:plan.activityId,replace:!plan.continuationOf});
     },
@@ -841,7 +873,8 @@ function handlePageLifecycle({state:next,previous,type}){
     renderPresence.invalidate(type);
     stopSpeech();setExpression('neutral');avatar?.setAttention?.('idle');
   }
-  if(next.frozen||next.inHistory||next.departed)releasePageConversation();
+  if(next.frozen||next.inHistory||next.departed){releasePeerActivity();releasePageConversation();}
+  else setupPeerActivity();
   if(next.departed){connectionStatus.dispose();void autonomyOwner?.dispose();return;}
   if(!next.blocked&&pageLeaving){
     pageLeaving=false;
@@ -855,6 +888,7 @@ for(const type of ['visibilitychange','freeze','resume'])document.addEventListen
 for(const type of ['pagehide','pageshow'])window.addEventListener(type,observePageEvent);
 async function init(){
   $('#send').disabled=true;
+  setupPeerActivity();
   const conversationPromise=openConversation();
   const statusPromise=connectionStatus.check();
   try{
@@ -872,7 +906,7 @@ async function init(){
     seat.z=-1.60-(avatar.thighLength ?? .37);
     avatar.root.position.set(1.5,0,1.6);avatar.root.rotation.y=.3;
     initialized=true;$('#loading').hidden=true;$('#send').disabled=!conversationReady;presence();
-    installDiagnostics({avatar,renderer,scene,camera,getWorldState:worldState,getAutonomyState:()=>autonomy?.getState(),getFeedback:()=>feedback,
+    installDiagnostics({avatar,renderer,scene,camera,getWorldState:worldState,getAutonomyState:()=>autonomy?{...autonomy.getState(),peerActive:peerIsActive()}:null,getFeedback:()=>feedback,
       getSimulationTime:()=>elapsed,
       getCameraAvoidance:()=>cameraAvoidance,
       getRenderPresence:()=>renderPresence.getState(),
