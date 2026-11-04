@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.local/
+*.log
+
+# Only the reviewed redistributable sample is public.
+public/assets/*.vrm
+public/assets/*.vrm.br
+!public/assets/avatar.vrm

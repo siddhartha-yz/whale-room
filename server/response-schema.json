@@ -1,0 +1,145 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "reply": {
+      "type": "string"
+    },
+    "expression": {
+      "type": "string",
+      "enum": [
+        "neutral",
+        "happy",
+        "sad",
+        "surprised",
+        "relaxed"
+      ]
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "move_to",
+              "sit",
+              "stand",
+              "wave",
+              "nod",
+              "look_at",
+              "read",
+              "drink",
+              "stretch"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "enum": [
+              "sofa",
+              "window",
+              "plant",
+              "center",
+              "user",
+              "none"
+            ]
+          }
+        },
+        "required": [
+          "type",
+          "target"
+        ]
+      },
+      "maxItems": 4
+    },
+    "memoryPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "set": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "preference",
+                  "proactive"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "persistent",
+                  "today",
+                  "session"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 400
+              },
+              "replacesId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "value",
+              "scope",
+              "evidence",
+              "replacesId"
+            ]
+          }
+        },
+        "forget": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 400
+              }
+            },
+            "required": [
+              "id",
+              "evidence"
+            ]
+          }
+        }
+      },
+      "required": [
+        "set",
+        "forget"
+      ]
+    }
+  },
+  "required": [
+    "reply",
+    "expression",
+    "actions",
+    "memoryPatch"
+  ]
+}

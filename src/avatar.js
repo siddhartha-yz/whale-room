@@ -1,0 +1,412 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
+import { createFaceController } from './face.js';
+import { configureFacialRig } from './facial-rig.js';
+import { createGaitState, stepGait, GAIT } from './gait.js';
+import { createActivityState, stepActivity, sampleActivity, cancelActivityState } from './activity-rig.js';
+import { loadAvatarModel } from './avatar-loader.js';
+
+const EXPRESSIONS = ['neutral', 'happy', 'sad', 'surprised', 'relaxed'];
+const damp = (from, to, rate, dt) => THREE.MathUtils.lerp(from, to, 1 - Math.exp(-rate * dt));
+const clamp = THREE.MathUtils.clamp;
+
+/**
+ * A local, replaceable VRM avatar. The outer root belongs to the room controller:
+ * +Z is forward, y=0 is the floor, units are metres. Animation is deliberately
+ * procedural in this prototype, with no learned controller or physics claims.
+ */
+export async function createAvatar(scene) {
+  const loader = new GLTFLoader();
+  loader.register((parser) => new VRMLoaderPlugin(parser));
+  const { vrm, modelSource, usingFallback } = await loadAvatarModel(loader);
+  // Book/cup reach targets were calibrated against the optional chibi model.
+  const supportedActivities = Object.freeze(usingFallback ? ['stretch'] : ['read', 'drink', 'stretch']);
+
+  VRMUtils.rotateVRM0(vrm);
+  const root = new THREE.Group();
+  root.name = 'CompanionAvatar';
+  root.add(vrm.scene);
+  scene.add(root);
+  vrm.scene.traverse((object) => {
+    if (object.isMesh) {
+      object.frustumCulled = false;
+      object.castShadow = true;
+      object.receiveShadow = true;
+    }
+  });
+
+  root.updateMatrixWorld(true);
+  const initialBox = new THREE.Box3().setFromObject(vrm.scene);
+  const height = usingFallback ? 1.65 : 1.35;
+  const scale = height / (initialBox.max.y - initialBox.min.y);
+  vrm.scene.scale.multiplyScalar(scale);
+  root.updateMatrixWorld(true);
+  const scaledBox = new THREE.Box3().setFromObject(vrm.scene);
+  const floorOffset = -scaledBox.min.y;
+  vrm.scene.position.y += floorOffset;
+  root.updateMatrixWorld(true);
+
+  const boneNames = [
+    'hips', 'spine', 'chest', 'upperChest', 'neck', 'head',
+    'leftShoulder', 'rightShoulder',
+    'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm',
+    'leftHand', 'rightHand',
+    'leftUpperLeg', 'rightUpperLeg', 'leftLowerLeg', 'rightLowerLeg',
+    'leftFoot', 'rightFoot',
+  ];
+  const fingerNames = [];
+  for (const side of ['left', 'right']) {
+    for (const finger of ['Index', 'Middle', 'Ring', 'Little']) {
+      for (const joint of ['Proximal', 'Intermediate', 'Distal']) fingerNames.push(`${side}${finger}${joint}`);
+    }
+    for (const joint of ['Metacarpal', 'Proximal', 'Distal']) fingerNames.push(`${side}Thumb${joint}`);
+  }
+  boneNames.push(...fingerNames);
+  const bones = Object.fromEntries(boneNames.map((name) => [name, vrm.humanoid.getNormalizedBoneNode(name)]));
+  const rest = Object.fromEntries(boneNames.map((name) => [name, bones[name]?.quaternion.clone()]));
+  const hipRest = bones.hips.position.clone();
+  const upperLegPoint = bones.leftUpperLeg.getWorldPosition(new THREE.Vector3());
+  const kneePoint = bones.leftLowerLeg.getWorldPosition(new THREE.Vector3());
+  // The chibi's legs are much shorter than an ordinary chair. Align the pelvis
+  // with the cushion and allow the feet to dangle; lowering by thigh length
+  // alone would leave her sitting inside the sofa. No translation of root.y
+  // is necessary, so room navigation stays in floor coordinates.
+  const thighLength = upperLegPoint.distanceTo(kneePoint);
+  const hipHeight = bones.hips.getWorldPosition(new THREE.Vector3()).y;
+  const headHeight = bones.head.getWorldPosition(new THREE.Vector3()).y;
+  const eyeBone = vrm.humanoid.getNormalizedBoneNode('leftEye');
+  const eyeHeight = eyeBone ? eyeBone.getWorldPosition(new THREE.Vector3()).y : headHeight + height * 0.10;
+  const seatSurfaceHeight = 0.50;
+  const pelvisUnderside = clamp(thighLength * 0.3, 0.035, 0.065);
+  const seatedHipHeight = seatSurfaceHeight + pelvisUnderside;
+  // Signed: this is negative when getting onto the sofa raises the avatar.
+  const sitDrop = hipHeight - seatedHipHeight;
+
+  const scratchEuler = new THREE.Euler();
+  const scratchQuaternion = new THREE.Quaternion();
+  const localTarget = new THREE.Vector3();
+  const expressionManager = vrm.expressionManager;
+  const facialRig = configureFacialRig(vrm);
+  const face = createFaceController();
+  let locomotion = createGaitState();
+  let sitBlend = 0;
+  let time = 0;
+  let yaw = 0;
+  let pitch = 0;
+  let gesture = null;
+  let gestureStart = 0;
+  let eyeYaw = 0;
+  let eyePitch = 0;
+  let isDisposed = false;
+  let activity = null;
+  let activitySequence = 0;
+  let activityResult = null;
+  const activityLookTarget = new THREE.Vector3();
+  const ik = {
+    shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), wrist: new THREE.Vector3(),
+    target: new THREE.Vector3(), direction: new THREE.Vector3(), pole: new THREE.Vector3(),
+    desiredElbow: new THREE.Vector3(), currentDirection: new THREE.Vector3(), wantedDirection: new THREE.Vector3(),
+    parentQuaternion: new THREE.Quaternion(), worldQuaternion: new THREE.Quaternion(), deltaQuaternion: new THREE.Quaternion(),
+    desiredQuaternion: new THREE.Quaternion(), rootQuaternion: new THREE.Quaternion(), orientation: new THREE.Quaternion(),
+  };
+
+  // Avoid driving the eye and head toward an uninitialised origin. The room
+  // supplies a world-space lookTarget when the companion should attend to it.
+  if (vrm.lookAt) vrm.lookAt.autoUpdate = false;
+
+  function pose(name, x = 0, y = 0, z = 0, smoothing = 12, dt = 1 / 60) {
+    const bone = bones[name];
+    if (!bone) return;
+    scratchEuler.set(x, y, z, 'XYZ');
+    scratchQuaternion.setFromEuler(scratchEuler).premultiply(rest[name]);
+    bone.quaternion.slerp(scratchQuaternion, 1 - Math.exp(-smoothing * dt));
+  }
+
+  function setGesture(name) {
+    if (!['wave', 'nod', 'none'].includes(name)) return false;
+    gesture = name === 'none' ? null : name;
+    gestureStart = time;
+    return true;
+  }
+
+  function setActivity(name, { props, durationSeconds = null } = {}) {
+    if (isDisposed || activity || !supportedActivities.includes(name)) return null;
+    if (name !== 'stretch' && !props?.getAnchors) return null;
+    const station = props?.stations?.[name];
+    if (station && Math.hypot(root.position.x - station.x, root.position.z - station.z) > 0.18) return null;
+    if (station && (sitBlend > 0.05 || Math.abs(Math.atan2(Math.sin(root.rotation.y - station.yaw), Math.cos(root.rotation.y - station.yaw))) > 0.25)) return null;
+    root.updateMatrixWorld(true);
+    const localHand = (side) => root.worldToLocal(vrm.humanoid.getRawBoneNode(`${side}Hand`).getWorldPosition(new THREE.Vector3())).toArray();
+    const anchors = { ...props?.getAnchors(root), restLeft: localHand('left'), restRight: localHand('right') };
+    const state = createActivityState(name, { durationSeconds, anchors });
+    let finish, begin;
+    const finished = new Promise((resolve) => { finish = resolve; });
+    const started = new Promise((resolve) => { begin = resolve; });
+    activity = { id: ++activitySequence, name, state, props, finish, begin, finished, started, begun: false, frame: sampleActivity(state), handErrors: {} };
+    setGesture('none');
+    return { id: activity.id, started, finished };
+  }
+
+  function cancelActivity() {
+    if (!activity) return Promise.resolve(activityResult ?? { status: 'idle' });
+    if (!activity.state.cancelling) {
+      activity.state = cancelActivityState(activity.state, { holdingProp: activity.name === 'drink' && activity.props?.isCupHeld() });
+      if (!activity.begun) activity.begin(false);
+    }
+    return activity.finished;
+  }
+
+  // A small two-link arm solver, used only at fixed interaction stations. Legs
+  // and navigation keep their existing controller; targets are avatar-local.
+  function reachHand(side, localPosition, weight, tilt = 0) {
+    if (weight <= 0.0001) return 0;
+    const upper = bones[`${side}UpperArm`], lower = bones[`${side}LowerArm`], hand = bones[`${side}Hand`];
+    root.updateMatrixWorld(true);
+    upper.getWorldPosition(ik.shoulder); lower.getWorldPosition(ik.elbow); hand.getWorldPosition(ik.wrist);
+    const upperLength = ik.shoulder.distanceTo(ik.elbow), lowerLength = ik.elbow.distanceTo(ik.wrist);
+    ik.target.fromArray(localPosition); root.localToWorld(ik.target);
+    ik.direction.copy(ik.target).sub(ik.shoulder);
+    const requestedDistance = ik.direction.length();
+    if (requestedDistance < 0.00001) return requestedDistance;
+    ik.direction.normalize();
+    const distance = clamp(requestedDistance, Math.abs(upperLength - lowerLength) + 0.001, upperLength + lowerLength - 0.001);
+    const along = (upperLength ** 2 - lowerLength ** 2 + distance ** 2) / (2 * distance);
+    const outward = side === 'left' ? 1 : -1;
+    ik.pole.set(outward * 0.40, 0.34 - sitDrop * sitBlend, 0.045); root.localToWorld(ik.pole);
+    ik.pole.sub(ik.shoulder);
+    ik.pole.addScaledVector(ik.direction, -ik.pole.dot(ik.direction));
+    if (ik.pole.lengthSq() < 0.000001) ik.pole.set(outward, 0, 0);
+    ik.pole.normalize();
+    ik.desiredElbow.copy(ik.shoulder).addScaledVector(ik.direction, along)
+      .addScaledVector(ik.pole, Math.sqrt(Math.max(0, upperLength ** 2 - along ** 2)));
+    const rotateToward = (bone, from, to) => {
+      if (from.lengthSq() < 1e-10 || to.lengthSq() < 1e-10) return;
+      ik.deltaQuaternion.setFromUnitVectors(from.normalize(), to.normalize());
+      bone.getWorldQuaternion(ik.worldQuaternion);
+      bone.parent.getWorldQuaternion(ik.parentQuaternion).invert();
+      ik.desiredQuaternion.copy(ik.deltaQuaternion).multiply(ik.worldQuaternion).premultiply(ik.parentQuaternion);
+      bone.quaternion.slerp(ik.desiredQuaternion, weight);
+      root.updateMatrixWorld(true);
+    };
+    ik.currentDirection.copy(ik.elbow).sub(ik.shoulder);
+    ik.wantedDirection.copy(ik.desiredElbow).sub(ik.shoulder);
+    rotateToward(upper, ik.currentDirection, ik.wantedDirection);
+    lower.getWorldPosition(ik.elbow); hand.getWorldPosition(ik.wrist);
+    ik.currentDirection.copy(ik.wrist).sub(ik.elbow);
+    ik.wantedDirection.copy(ik.shoulder).addScaledVector(ik.direction, distance).sub(ik.elbow);
+    rotateToward(lower, ik.currentDirection, ik.wantedDirection);
+    root.getWorldQuaternion(ik.rootQuaternion);
+    ik.orientation.setFromEuler(scratchEuler.set(tilt, side === 'left' ? -Math.PI / 2 : Math.PI / 2, 0, 'XYZ'));
+    hand.parent.getWorldQuaternion(ik.parentQuaternion).invert();
+    ik.desiredQuaternion.copy(ik.rootQuaternion).multiply(ik.orientation).premultiply(ik.parentQuaternion);
+    hand.quaternion.slerp(ik.desiredQuaternion, weight);
+    root.updateMatrixWorld(true);
+    hand.getWorldPosition(ik.wrist);
+    return ik.wrist.distanceTo(ik.target);
+  }
+
+  function update(rawDt, context = {}) {
+    if (isDisposed) return;
+    const dt = clamp(rawDt, 0, 0.05);
+    time += dt;
+    const speed = Math.max(0, Number(context.speed) || 0);
+    const desiredSit = Number.isFinite(context.sitBlend)
+      ? clamp(context.sitBlend, 0, 1)
+      : (context.seated ? 1 : 0);
+    sitBlend = Number.isFinite(context.sitBlend)
+      ? desiredSit
+      : damp(sitBlend, desiredSit, 4.3, dt);
+    locomotion = stepGait(locomotion, dt, { speed, sitBlend, direction: context.walkDirection });
+    if (activity) {
+      activity.state = stepActivity(activity.state, dt);
+      activity.frame = sampleActivity(activity.state);
+    }
+    const activityFrame = activity?.frame;
+    const facial = face.update(dt, { moving: speed > 0.03 });
+    const breath = Math.sin(time * 1.65);
+    const seated = sitBlend;
+    const standing = 1 - seated;
+
+    // Keep foot placement and stride modest, suitable for a small living room.
+    pose('leftUpperLeg', locomotion.leftHip - 1.55 * seated, 0, -0.035 * seated, 16, dt);
+    pose('rightUpperLeg', locomotion.rightHip - 1.55 * seated, 0, 0.035 * seated, 16, dt);
+    pose('leftLowerLeg', locomotion.leftKnee + 1.55 * seated, 0, 0, 16, dt);
+    pose('rightLowerLeg', locomotion.rightKnee + 1.55 * seated, 0, 0, 16, dt);
+    pose('leftFoot', locomotion.leftAnkle, 0, 0, 16, dt);
+    pose('rightFoot', locomotion.rightAnkle, 0, 0, 16, dt);
+
+    bones.hips.position.copy(hipRest);
+    bones.hips.position.y += (locomotion.bob + breath * 0.002 * standing) / scale;
+    // This translation is in the avatar's local space; the room owns root.y.
+    vrm.scene.position.y = floorOffset - sitDrop * seated;
+    pose('hips', 0.015 * seated, locomotion.hipYaw, locomotion.hipRoll, 10, dt);
+    pose('spine', -0.025 + 0.035 * seated + breath * 0.008 + (activityFrame?.spineLean ?? 0), 0, Math.sin(time * 0.7) * 0.006 * standing, 10, dt);
+    pose('chest', breath * 0.009 + (activityFrame?.chestLean ?? 0), locomotion.chestYaw, 0, 10, dt);
+    pose('upperChest', 0, 0, 0, 10, dt);
+    pose('leftShoulder', 0, 0, -0.025, 10, dt);
+    pose('rightShoulder', 0, 0, 0.025, 10, dt);
+
+    // The normalised skeleton has a T-pose. These Z rotations lower the arms;
+    // mild elbow flexion and separated hands avoid intersecting the clothing.
+    let leftArmX = locomotion.leftArm - 0.16 * seated;
+    let rightArmX = locomotion.rightArm - 0.16 * seated;
+    let leftArmZ = -1.22 + 0.06 * seated;
+    let rightArmZ = 1.22 - 0.06 * seated;
+    let rightElbowY = 0.16;
+    let rightElbowZ = 0;
+    let rightHandZ = 0;
+    let nod = 0;
+    if (activityFrame?.stretch) {
+      const stretch = activityFrame.stretch;
+      leftArmZ = THREE.MathUtils.lerp(leftArmZ, -0.35, stretch);
+      rightArmZ = THREE.MathUtils.lerp(rightArmZ, 0.35, stretch);
+      leftArmX = THREE.MathUtils.lerp(leftArmX, -0.08, stretch);
+      rightArmX = THREE.MathUtils.lerp(rightArmX, -0.08, stretch);
+    }
+    const gestureAge = time - gestureStart;
+    if (gesture === 'wave') {
+      const envelope = Math.min(1, gestureAge / 0.35) * Math.min(1, Math.max(0, (2.8 - gestureAge) / 0.45));
+      // Keep the hand beside the cheek rather than through the oversized head.
+      rightArmZ = THREE.MathUtils.lerp(rightArmZ, 0.12, envelope);
+      rightArmX = THREE.MathUtils.lerp(rightArmX, -0.12, envelope);
+      rightElbowY = THREE.MathUtils.lerp(rightElbowY, 0.08, envelope);
+      rightElbowZ = -0.95 * envelope;
+      rightHandZ = Math.sin(gestureAge * 13) * 0.30 * envelope;
+      if (gestureAge > 2.8) gesture = null;
+    } else if (gesture === 'nod') {
+      const envelope = Math.sin(Math.min(1, gestureAge / 1.5) * Math.PI);
+      nod = Math.sin(gestureAge * 8.5) * 0.16 * envelope;
+      if (gestureAge > 1.5) gesture = null;
+    }
+    pose('leftUpperArm', leftArmX, 0, leftArmZ, 11, dt);
+    pose('rightUpperArm', rightArmX, 0, rightArmZ, 11, dt);
+    pose('leftLowerArm', 0, -0.16 - seated * 0.55, 0, 11, dt);
+    pose('rightLowerArm', 0, rightElbowY + seated * 0.55, rightElbowZ, 11, dt);
+    pose('leftHand', 0.05, 0, -0.04, 11, dt);
+    pose('rightHand', 0.05, 0, 0.04 + rightHandZ, 11, dt);
+    for (const name of fingerNames) {
+      const side = name.startsWith('left') ? 'left' : 'right';
+      const curl = activityFrame?.[`${side}Curl`] ?? 0;
+      const factor = name.includes('Distal') ? 0.65 : name.includes('Intermediate') ? 0.85 : 1;
+      pose(name, 0, 0, (side === 'left' ? -1 : 1) * curl * factor, 14, dt);
+    }
+    if (activityFrame) {
+      activity.handErrors.left = reachHand('left', activityFrame.leftWrist, activityFrame.leftWeight, activityFrame.leftTilt);
+      activity.handErrors.right = reachHand('right', activityFrame.rightWrist, activityFrame.rightWeight, activityFrame.rightTilt);
+    }
+
+    let targetYaw = 0;
+    let targetPitch = 0;
+    let lookTarget = context.lookTarget;
+    // Reading can briefly attend to the user while the hands keep their page
+    // targets. Drinking retains its own gaze so a sip cannot turn into the cup.
+    if (activityFrame?.lookAt && (activity?.name !== 'read' || !context.lookTarget?.isVector3)) {
+      activityLookTarget.fromArray(activityFrame.lookAt); root.localToWorld(activityLookTarget); lookTarget = activityLookTarget;
+    }
+    if (lookTarget?.isVector3) {
+      root.updateMatrixWorld(true);
+      localTarget.copy(lookTarget);
+      root.worldToLocal(localTarget);
+      const headY = eyeHeight - sitDrop * seated;
+      const yawLimit = activity?.name === 'read' ? 0.42 : 0.55;
+      targetYaw = clamp(Math.atan2(localTarget.x, localTarget.z), -yawLimit, yawLimit);
+      const pitchLimit = activityFrame?.pitchLimit ?? 0.2;
+      targetPitch = clamp(-Math.atan2(localTarget.y - headY, Math.hypot(localTarget.x, localTarget.z)), -pitchLimit, pitchLimit);
+    }
+    yaw = damp(yaw, targetYaw + facial.gazeYaw * 0.35, 4, dt);
+    pitch = damp(pitch, targetPitch + facial.gazePitch * 0.3, 4, dt);
+    pose('neck', pitch * 0.3, yaw * 0.35, 0, 8, dt);
+    pose('head', pitch * 0.7 + nod, yaw * 0.65, Math.sin(time * 0.55) * 0.006 + facial.headTilt, 8, dt);
+
+    // Update the actual head transform before calculating residual eye gaze.
+    // Otherwise lookAt uses last frame's pose and fights the moving head.
+    vrm.humanoid.update();
+    vrm.scene.updateMatrixWorld(true);
+    if (vrm.lookAt) {
+      if (lookTarget?.isVector3) vrm.lookAt.lookAt(lookTarget);
+      else vrm.lookAt.reset();
+      const desiredEyeYaw = clamp(vrm.lookAt.yaw + THREE.MathUtils.RAD2DEG * facial.gazeYaw * 3, -65, 65);
+      const desiredEyePitch = clamp(vrm.lookAt.pitch + THREE.MathUtils.RAD2DEG * facial.gazePitch * 3, -35, 35);
+      eyeYaw = damp(eyeYaw, desiredEyeYaw, 14, dt);
+      eyePitch = damp(eyePitch, desiredEyePitch, 14, dt);
+      vrm.lookAt.yaw = eyeYaw;
+      vrm.lookAt.pitch = eyePitch;
+    }
+    for (const name of EXPRESSIONS) expressionManager.setValue(name, 0);
+    for (const name of ['happy', 'relaxed', 'sad']) {
+      const channels = facialRig.channels?.[name];
+      if (channels) {
+        expressionManager.setValue(channels.eyes, facial.channels[`${name}Eyes`]);
+        expressionManager.setValue(channels.mouth, facial.channels[`${name}Mouth`]);
+      } else {
+        // The fallback is only for a replacement model without a splittable
+        // face. Keep its combined preset below the eye-safe strength.
+        expressionManager.setValue(name, facial.channels[`${name}Eyes`]);
+      }
+    }
+    expressionManager.setValue('blink', facial.blink);
+    // This model's surprised preset has no binds; its round vowel provides a visible gasp.
+    for (const [name, weight] of Object.entries(facial.vowels)) expressionManager.setValue(name, weight);
+    vrm.update(dt);
+    if (activity) {
+      vrm.scene.updateMatrixWorld(true);
+      const current = activity, frame = current.frame, props = current.props;
+      if (current.name === 'read') props.updateBook(frame.bookOpen, frame.pageFlip);
+      if (current.name === 'drink') {
+        const handMatrix = vrm.humanoid.getRawBoneNode('rightHand').matrixWorld;
+        if (frame.shouldHoldCup && !props.isCupHeld()) props.attachCup(handMatrix);
+        if (props.isCupHeld()) props.updateHeldCup(handMatrix);
+        if (!frame.shouldHoldCup && props.isCupHeld()) props.releaseCup();
+      }
+      if (frame.started && !frame.cancelling && !current.begun) { current.begun = true; current.begin(true); }
+      if (frame.done) {
+        if (!current.begun) current.begin(false);
+        const placement = current.name === 'drink' ? props.getCupReturnError() : null;
+        const status = frame.cancelling ? 'cancelled' : placement && (placement.position > 0.025 || placement.angle > 0.2) ? 'failed' : 'completed';
+        activityResult = { id: current.id, name: current.name, status, placement };
+        activity = null;
+        current.finish(activityResult);
+      }
+    }
+  }
+
+  // Establish the resting pose before the first visible frame, avoiding an
+  // unexpected T-pose during loading. Spring bones settle in the regular loop.
+  for (let i = 0; i < 45; i++) update(1 / 60, {});
+
+  return {
+    root,
+    vrm,
+    ready: true,
+    modelSource,
+    usingFallback,
+    supportedActivities,
+    height,
+    headHeight,
+    eyeHeight,
+    hipHeight,
+    thighLength,
+    seatHeight: seatSurfaceHeight,
+    seatedHipHeight,
+    preferredWalkSpeed: GAIT.nominalSpeed,
+    sitDrop,
+    expressions: [...EXPRESSIONS],
+    update,
+    setExpression: face.setExpression,
+    setAttention: face.setAttention,
+    setSpeaking: face.setSpeaking,
+    setGesture,
+    setActivity,
+    cancelActivity,
+    getState() { return { ...face.getState(), gesture, seated: sitBlend > 0.95, sitBlend, walkBlend: locomotion.blend, gaitPhase: locomotion.phase, gaze: { yaw: eyeYaw, pitch: eyePitch }, facialRig: facialRig.supported,
+      activity: activity ? { id: activity.id, name: activity.name, phase: activity.frame.phase, elapsed: activity.state.elapsed, cancelling: activity.state.cancelling, holdingProp: activity.name === 'drink' && activity.props?.isCupHeld(), handErrors: { ...activity.handErrors } } : null,
+      activityResult,
+    }; },
+    dispose() {
+      isDisposed = true;
+      root.removeFromParent();
+      VRMUtils.deepDispose(vrm.scene);
+    },
+  };
+}

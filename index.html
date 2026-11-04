@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#f5f7fa" />
+  <title>鲸鱼娘</title>
+</head>
+<body>
+  <main class="app">
+    <section id="room" aria-label="鲸鱼娘的房间">
+      <details class="room-help"><summary>操作</summary><p>拖动旋转，滚轮缩放。<br>点击空地移动。</p></details>
+      <div class="view-tools" aria-label="镜头"><button id="view-room" class="active">全景</button><button id="view-close">近景</button></div>
+      <div id="loading" role="status"><span class="loader"></span><span>加载中…</span></div>
+      <div id="room-error" hidden role="alert"></div>
+      <div class="room-controls" aria-label="动作控制">
+        <button data-action="sit">坐下</button><button data-action="stand">起身</button><button data-action="wave">招手</button>
+        <details class="activity-picker"><summary>活动</summary><div class="activity-row" aria-label="选择活动"><button data-action="window">去窗边</button><button data-action="read">看书</button><button data-action="drink">喝水</button><button data-action="stretch">伸展</button></div></details>
+        <details class="expression-picker"><summary>表情</summary><div class="expression-row" aria-label="选择表情"><button data-expression="neutral" class="selected">平静</button><button data-expression="happy">开心</button><button data-expression="relaxed">放松</button><button data-expression="surprised">惊讶</button><button data-expression="sad">难过</button></div></details>
+        <button id="stop" title="停止当前动作与回复">停下</button>
+      </div>
+    </section>
+    <aside class="chat-panel" aria-label="聊天">
+      <header class="chat-header"><div class="identity"><h1>鲸鱼娘</h1><span id="presence">加载中</span></div>
+        <details id="settings" class="settings"><summary>设置</summary><div class="settings-content">
+          <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">连接中…</span></div>
+          <p id="provider-note">本地场景无需登录；聊天可选连接本机 Codex。</p>
+          <p id="avatar-note">公开版附带 pixiv 示例角色。</p>
+          <label class="voice-toggle"><input type="checkbox" id="voice" /><span>朗读回复</span></label>
+          <p>自主活动会使用订阅用量，每小时最多 24 次。</p>
+          <details class="activity-details"><summary>活动详情</summary><p id="autonomy-reason">暂无</p></details>
+          <div class="settings-links"><a href="/assets/ATTRIBUTION.txt" target="_blank" rel="noopener">模型来源与许可</a></div>
+          <button id="clear-chat" type="button">清空对话</button>
+        </div></details>
+      </header>
+      <div class="autonomy-bar"><label class="autonomy-toggle"><input id="autonomy-enabled" type="checkbox" disabled /><span>自主活动</span></label><span id="autonomy-status" role="status">准备中</span><span id="autonomy-dot" hidden></span><button id="autonomy-now" type="button" disabled>换个活动</button></div>
+      <div class="conversation" id="messages" aria-live="polite" aria-label="对话记录"><div class="welcome">暂无消息</div></div>
+      <div id="thinking" hidden><span class="thinking-dots">•••</span> 输入中 <button id="cancel-reply">取消</button></div>
+      <form id="chat-form"><label for="message-input" class="sr-only">消息</label><textarea id="message-input" rows="2" placeholder="发消息…" maxlength="3000"></textarea><div class="composer-footer"><span>Enter 发送</span><button id="send" type="submit">发送</button></div></form>
+    </aside>
+  </main>
+  <div id="toast" role="status" hidden></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

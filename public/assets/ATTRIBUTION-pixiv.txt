@@ -1,0 +1,38 @@
+Avatar asset
+============
+File: avatar.vrm (unmodified upstream VRM binary)
+Name: VRM1_Constraint_Twist_Sample
+Version in embedded metadata: v1.0.1
+Author: pixiv Inc.
+Copyright: (c) 2022 pixiv Inc.
+Source repository: https://github.com/pixiv/three-vrm
+Source file: https://github.com/pixiv/three-vrm/blob/release/packages/three-vrm/examples/models/VRM1_Constraint_Twist_Sample.vrm
+Download URL: https://raw.githubusercontent.com/pixiv/three-vrm/release/packages/three-vrm/examples/models/VRM1_Constraint_Twist_Sample.vrm
+Retrieved: 2026-11-03
+
+The avatar is governed by the VRM Public License 1.0 and the permissions
+embedded in this VRM file, not merely the MIT license of the three-vrm code.
+License: https://vrm.dev/licenses/1.0/
+English license text: https://vrm.dev/licenses/1.0/pdf/en.pdf
+
+Embedded permissions:
+  avatarPermission: everyone
+  commercialUsage: corporation
+  creditNotation: unnecessary
+  allowRedistribution: true
+  modification: allowModificationRedistribution
+  allowAntisocialOrHateUsage: false
+  allowExcessivelySexualUsage: true
+  allowExcessivelyViolentUsage: true
+  allowPoliticalOrReligiousUsage: true
+
+This prototype uses the model as a fictional virtual companion. Procedural
+poses and expressions are generated at runtime; the original binary retains
+its author, copyright, license and permission metadata. The model and license
+must be reviewed again when replacing or redistributing the avatar.
+
+Runtime software: three.js (MIT), @pixiv/three-vrm (MIT).
+
+Verified against the official download URL again: 2026-11-05
+SHA-256: 12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2
+Size: 10776032 bytes

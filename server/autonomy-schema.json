@@ -1,0 +1,89 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "activity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "reply": {
+      "type": "string",
+      "maxLength": 600
+    },
+    "expression": {
+      "type": "string",
+      "enum": [
+        "neutral",
+        "happy",
+        "sad",
+        "surprised",
+        "relaxed"
+      ]
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "move_to",
+              "sit",
+              "stand",
+              "wave",
+              "nod",
+              "look_at",
+              "read",
+              "drink",
+              "stretch"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "enum": [
+              "sofa",
+              "window",
+              "plant",
+              "center",
+              "user",
+              "none"
+            ]
+          }
+        },
+        "required": [
+          "type",
+          "target"
+        ]
+      }
+    },
+    "dwellSeconds": {
+      "type": "integer",
+      "minimum": 60,
+      "maximum": 240
+    },
+    "continuationOf": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "activity",
+    "reason",
+    "reply",
+    "expression",
+    "actions",
+    "dwellSeconds",
+    "continuationOf"
+  ]
+}

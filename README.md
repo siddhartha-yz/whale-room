@@ -1,0 +1,64 @@
+# 鲸鱼娘 · 本地 3D 陪伴原型
+
+浏览器里的小房间：角色可以走动、坐下、起身、招手、做表情和伸展。场景、模型与动作都在本机运行；聊天和自主活动可选接入本机 Codex CLI。使用 Three.js、three-vrm、Vite 和 Express，动作是程序化动画，没有接入 SuperMimic 或物理训练。
+
+公开仓库附带 **pixiv 官方 VRM 示例角色**，因此直接克隆看到的是普通比例的示例人物。原先使用的 Q 版鲸鱼模型不允许再分发，仓库不包含该文件。看书、拿杯喝水的触达轨迹按鲸鱼模型比例校准，示例人物上会禁用这两个活动；基础动作和伸展仍可用。
+
+## 先打开本地场景
+
+需要 Node.js 22.12 或更高版本、npm，以及支持 WebGL 的现代桌面浏览器。先在仓库目录执行：
+
+```bash
+npm ci
+COMPANION_OFFLINE=1 npm run dev
+```
+
+打开终端显示的地址，默认是 http://127.0.0.1:4317 。拖动旋转、滚轮缩放，点击空地行走；底部按钮切换动作和表情。`COMPANION_OFFLINE=1` 明确关闭聊天与自主模型请求，不需要账号、密钥或 Codex。首次安装依赖需要联网；依赖安装后，场景和示例模型不需要联网下载。
+
+构建后运行：
+
+```bash
+npm run build
+COMPANION_OFFLINE=1 npm start
+```
+
+Linux / Bash 用户也可以运行 `COMPANION_OFFLINE=1 ./启动鲸鱼娘.sh`；脚本在缺少依赖时执行 `npm ci`，然后构建并启动。`启动小栖.sh` 是兼容旧文件名的入口。按 Ctrl+C 停止。端口被占用时可用 `PORT=4318` 指定新端口，并打开相应地址。
+
+## 可选：开启陪聊
+
+按 [Codex CLI 官方文档](https://learn.chatgpt.com/docs/codex/cli) 安装 CLI，然后执行：
+
+```bash
+codex login
+codex login status
+npm run dev
+```
+
+最后一条命令不要设置 `COMPANION_OFFLINE=1`。官方支持使用 ChatGPT 登录 Codex；账号是否包含相应权限与用量，以 [官方认证说明](https://learn.chatgpt.com/docs/auth) 和账号实际状态为准。本原型使用本机 CLI 的登录，不把 ChatGPT 网页订阅当作通用 API 密钥。
+
+后端当前固定请求 `gpt-6-astra`。需要本机 Codex 版本支持源码使用的参数，且该账号实际可用此模型；登录成功本身不证明模型权限。没有权限或 CLI 不兼容时，页面会显示错误，离线场景仍可使用。这里没有自动降级到其他模型，也没有提供通用 API Key 接口。
+
+正常模式下，页面的“自主活动”默认开启；只有模型连接可用时才会发起真实请求并消耗账号用量。可在页面关闭，应用每小时最多发起 24 次自主请求。手动聊天也会使用模型。朗读使用浏览器提供的本地中文语音，没有可用声音时仍可文字聊天。
+
+## 模型与许可
+
+- `public/assets/avatar.vrm` 是未修改的 `VRM1_Constraint_Twist_Sample`，作者 pixiv Inc.，按 VRM Public License 1.0 与模型内嵌许可分发。内嵌 `allowRedistribution: true`。来源、许可链接、校验值见 [ATTRIBUTION-pixiv.txt](public/assets/ATTRIBUTION-pixiv.txt)。模型许可与 three-vrm 代码的 MIT 许可不同。
+- 若自行取得鲸鱼模型的合法个人使用授权，可仅在本机放置 `public/assets/deepseek-chibi.vrm`。加载器优先尝试它，失败则加载公开示例。该路径已被 Git 忽略；不要上传模型，也不要公开包含它的构建目录。具体作者与使用限制见 [ATTRIBUTION.txt](public/assets/ATTRIBUTION.txt)。
+- 切换为其他 VRM 需要重新验证骨骼、表情、坐姿和道具触达。本原型不承诺任意 VRM 都有同样动作效果。
+
+## 测试与边界
+
+```bash
+npm test
+npm run build
+```
+
+通用的状态机、导航、表情时序、动作协议、记忆和后端测试不需要鲸鱼模型。公开示例另有实际骨骼 smoke test。鲸鱼眼部、步态和书杯触达等依赖原始几何的测试，在模型缺失时会明确显示 `SKIP Local-only whale VRM is not distributed`；这不代表公开示例通过了鲸鱼专用几何验收。测试使用模拟后端，不会调用真实模型。
+
+读书道具在此基线版本仅是动画用书页，不具备阅读具体书籍内容的能力。角色动作和模型回复通过受限 JSON 协议连接，模型不能任意调用浏览器或 shell。角色可能有穿插或脚滑；这是本机研究原型。
+
+## 本地数据
+
+服务只监听 `127.0.0.1`，校验 Host 与 API Origin；不要直接部署成公开服务。聊天记录、确认过的记忆和活动摘要保存在当前浏览器的本地存储中，可在设置里清空对话、删除记忆，或清除此站点数据。启用聊天后，消息和所需上下文会发送给所选模型服务。
+
+`.local/` 保存临时运行目录或显式开启检查功能后产生的诊断文件；`.local/`、`dist/`、依赖、环境配置、日志和本地鲸鱼模型均不应提交。仓库不包含登录凭据或私人聊天记录。

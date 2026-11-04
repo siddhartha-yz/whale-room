@@ -1,0 +1,25 @@
+Public avatar bundle
+===================
+Included file: avatar.vrm
+Author: pixiv Inc. (c) 2022 pixiv Inc.
+Name: VRM1_Constraint_Twist_Sample v1.0.1
+License: VRM Public License 1.0 and the permissions embedded in the VRM.
+The embedded allowRedistribution setting is true.
+See ATTRIBUTION-pixiv.txt for the original source, license and checksum.
+This model is an unchanged official sample, not the whale character.
+
+Optional local whale model — NOT DISTRIBUTED
+============================================
+Expected local filename: deepseek-chibi.vrm
+Model author: 木子恶魔 / MZEM
+Author's model page: https://www.aplaybox.com/details/model/ayXkRzVflmnd
+The author's terms prohibit redistribution and commercial use; credit is
+required. Obtain and review authorization from the original author before
+using a local copy. The public project grants no rights to this model.
+Do not commit it, upload it, or publish a dist/ build containing it.
+The public application falls back to the included pixiv model when this
+optional file is missing or cannot be loaded. Book/cup interactions are
+only enabled with the separately obtained local model.
+
+Runtime software: three.js (MIT), @pixiv/three-vrm (MIT).
+The runtime software licenses do not replace either model's license.
