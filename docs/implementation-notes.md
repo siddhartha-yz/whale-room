@@ -8,7 +8,7 @@
 
 ## 画面与接触
 
-[Godot 的 SpringArm 说明](https://docs.godotengine.org/en/stable/tutorials/3d/spring_arm.html) 提供了避开相机与主体之间障碍的参考。这里保留用户转动镜头的目标，实际近景机位按角色位置避让，必要时留出安全距离。[Unity 的两骨 IK 说明](https://docs.unity3d.com/Packages/com.unity.animation.rigging@1.3/manual/constraints/TwoBoneIKConstraint.html) 可用来理解脚和手的目标、关节方向与权重。本项目按当前 Q 版模型单独校准；换模型后不会承诺道具触达通用。
+[Godot 的 SpringArm 说明](https://docs.godotengine.org/en/stable/tutorials/3d/spring_arm.html) 提供了避开相机与主体之间障碍的参考。这里保留用户转动镜头的目标，实际近景机位按角色位置避让，必要时留出安全距离。[Unity 的两骨 IK 说明](https://docs.unity3d.com/Packages/com.unity.animation.rigging@1.3/manual/constraints/TwoBoneIKConstraint.html) 可用来理解脚和手的目标、关节方向与权重。本项目按当前 Q 版模型单独校准；换模型后不会承诺道具触达通用。公开 pixiv 示例也有独立坐姿：在同进度的实景对照中，坐下中段不再看见鞋子沉进地板，坐稳后鞋底接近地面。坐下高度随腿部弯曲调整，水平滑步和少量衣料相交仍存在。
 
 “看向”也受姿态限制。站着时可以转身，坐着或在桌边时保留姿势，只对当前能朝向的目标执行；转身还在进行或被打断时不记录完成。这里判断的是朝向，不是眼动追踪。
 

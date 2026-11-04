@@ -80,7 +80,26 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
   const eyeBone = vrm.humanoid.getNormalizedBoneNode('leftEye');
   const eyeHeight = eyeBone ? eyeBone.getWorldPosition(new THREE.Vector3()).y : headHeight + height * 0.10;
   const seatSurfaceHeight = 0.50;
-  const pelvisUnderside = clamp(thighLength * 0.3, 0.035, 0.065);
+  // The bundled pixiv sample needs its own seated height and fold for the sofa.
+  // Keep this calibration restricted to the verified sample rig.
+  const publicMeshes = new Map();
+  vrm.scene.traverse(mesh => {
+    if (!mesh.isSkinnedMesh) return;
+    const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+    publicMeshes.set(material?.name, mesh.geometry.attributes.position.count);
+  });
+  const publicSeatCalibrated = usingFallback && vrm.meta?.metaVersion === '1'
+    && vrm.meta.name === 'VRM1_Constraint_Twist_Sample' && vrm.meta.version === 'v1.0.1'
+    && vrm.meta.authors?.length === 1 && vrm.meta.authors[0] === 'pixiv Inc.'
+    && vrm.nodeConstraintManager?.constraints.size === 14
+    && Math.abs(thighLength - .3605405422592398) < .0001
+    && Math.abs(kneePoint.distanceTo(bones.leftFoot.getWorldPosition(new THREE.Vector3())) - .4243882792915829) < .0001
+    && Math.abs(hipHeight - .9275161234035684) < .0001
+    && ['leftUpperLeg', 'leftLowerLeg', 'leftFoot', 'rightUpperLeg', 'rightLowerLeg', 'rightFoot'].every(name =>
+      vrm.humanoid.getRawBoneNode(name)?.name === `J_Bip_${name.startsWith('left') ? 'L' : 'R'}_${name.replace(/^(left|right)/, '')}`)
+    && [['Body_00_SKIN',5307],['Bottoms_01_CLOTH',470],['Shoes_01_CLOTH',600],['Tops_01_CLOTH',717]].every(([name,count]) => publicMeshes.get(name) === count);
+  const seatLegAngle = publicSeatCalibrated ? 1.344 : 1.55;
+  const pelvisUnderside = publicSeatCalibrated ? .165 : clamp(thighLength * 0.3, 0.035, 0.065);
   const seatedHipHeight = seatSurfaceHeight + pelvisUnderside;
   // Signed: this is negative when getting onto the sofa raises the avatar.
   const sitDrop = hipHeight - seatedHipHeight;
@@ -284,17 +303,25 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
     const standing = 1 - seated;
 
     // Keep foot placement and stride modest, suitable for a small living room.
-    pose('leftUpperLeg', locomotion.leftHip - 1.55 * seated, 0, -0.035 * seated, 16, dt);
-    pose('rightUpperLeg', locomotion.rightHip - 1.55 * seated, 0, 0.035 * seated, 16, dt);
-    pose('leftLowerLeg', locomotion.leftKnee + 1.55 * seated, 0, 0, 16, dt);
-    pose('rightLowerLeg', locomotion.rightKnee + 1.55 * seated, 0, 0, 16, dt);
+    pose('leftUpperLeg', locomotion.leftHip - seatLegAngle * seated, 0, -0.035 * seated, 16, dt);
+    pose('rightUpperLeg', locomotion.rightHip - seatLegAngle * seated, 0, 0.035 * seated, 16, dt);
+    pose('leftLowerLeg', locomotion.leftKnee + seatLegAngle * seated, 0, 0, 16, dt);
+    pose('rightLowerLeg', locomotion.rightKnee + seatLegAngle * seated, 0, 0, 16, dt);
     pose('leftFoot', locomotion.leftAnkle, 0, 0, 16, dt);
     pose('rightFoot', locomotion.rightAnkle, 0, 0, 16, dt);
 
     bones.hips.position.copy(hipRest);
     bones.hips.position.y += (locomotion.bob + breath * 0.002 * standing) / scale;
     // This translation is in the avatar's local space; the room owns root.y.
-    vrm.scene.position.y = floorOffset - sitDrop * seated;
+    let seatHeightBlend = seated;
+    if (publicSeatCalibrated && seated > 0) {
+      // Following the current damped fold avoids lowering the pelvis before
+      // the long legs have actually bent. This is not a horizontal foot lock.
+      scratchQuaternion.copy(rest.leftUpperLeg).invert().multiply(bones.leftUpperLeg.quaternion);
+      scratchEuler.setFromQuaternion(scratchQuaternion);
+      seatHeightBlend = (1 - Math.cos(Math.abs(scratchEuler.x))) / (1 - Math.cos(seatLegAngle));
+    }
+    vrm.scene.position.y = floorOffset - sitDrop * seatHeightBlend;
     pose('hips', 0.015 * seated, locomotion.hipYaw, locomotion.hipRoll, 10, dt);
     const footPose = footPlacement.update(dt, { sitBlend: seated, time, groundHeightAt: context.groundHeightAt });
     pose('spine', -0.025 + 0.035 * seated + breath * 0.008 + (activityFrame?.spineLean ?? 0), 0, Math.sin(time * 0.7) * 0.006 * standing, 10, dt);
@@ -482,6 +509,7 @@ export async function createAvatar(scene, { tailGround = false } = {}) {
     vrm,
     ready: true,
     modelSource,
+    publicSeatCalibrated,
     usingFallback,
     supportedActivities,
     tabletopSupported,
