@@ -11,6 +11,7 @@ import { installMemoryControls } from './memory-ui.js';
 import { createActivityJournal } from './activity-journal.js';
 import { createAutonomyOwner } from './autonomy-owner.js';
 import { createPeerActivity } from './peer-activity.js';
+import { classifyLookAction } from './look-action.js';
 import { createConversation } from './conversation.js';
 import { createConversationScope } from './conversation-scope.js';
 import { constrainRoomCamera, sampleCameraOrbit, resolveCameraOcclusion } from './camera.js';
@@ -62,6 +63,7 @@ let avatar;
 let state={mode:'idle',expression:'neutral',place:'房间里',sitBlend:0,speed:0};
 let movement=null, brakingMotion=null, transition=null, gestureWait=null, actionVersion=0, cameraTween=null, activeRequest=null;
 let turning=null, activityRun=null, activityExit=null, nextActivityId=0;
+let explicitLook=null;
 let interactionStation=null;
 const TABLE_STAGING_Z=1.62;
 const settleWaiters=[];
@@ -167,6 +169,12 @@ function useSeatContactCurve(){return Boolean(seatContactEnabled&&avatar?.getSta
 function cancelActions({activityEnding=false}={}){
   actionVersion++;
   if(turning){turning.resolve(false);turning=null;}
+  if(explicitLook){
+    const run=explicitLook;explicitLook=null;
+    run.resolve?.(false);
+    if(run.applied&&currentLook===run.target)lookAt('user');
+    record('look_at','cancelled','视线转向被打断');
+  }
   const activeActivity=avatar?.getState().activity;
   if(activeActivity){
     const endingRead=activityEnding&&activeActivity.name==='read';
@@ -283,6 +291,30 @@ function turnTo(yaw,token){
     turning={from:avatar.root.rotation.y,delta,elapsed:0,duration:Math.max(.25,1.5*Math.abs(delta)/(avatar.preferredTurnSpeed??4.8)),resolve};
   });
 }
+function lookDecision(target,{allowTurn=true,activity=avatar.getState().activity}={}){
+  const cup=currentCup();
+  return classifyLookAction({
+    position:avatar.root.position,yaw:avatar.root.rotation.y,
+    target:target==='user'?camera.position:gazeTargets[target],
+    canTurn:allowTurn&&state.mode==='idle'&&state.sitBlend===0&&!movement&&!brakingMotion&&!transition&&!turning&&!isAtInteractionEdge(),
+    activity:cup?.held||cup?.blocked?{...activity,holdingProp:cup.held,blocked:cup.blocked}:activity,
+    calibrated:avatar.tabletopSupported,
+  });
+}
+async function performLook(target,token){
+  const label=places[target]?.label||'那里';
+  const first=lookDecision(target);
+  if(!first.ok)return {ok:false,detail:first.reason==='activity-owns-gaze'?'当前动作需要留意杯子':`当前姿势无法朝向${label}`};
+  const run={target,previous:currentLook,previousLease:activityLookLease,applied:false,elapsed:0,resolve:null};explicitLook=run;
+  try{
+    if(first.turnYaw!==null&&(!await turnTo(first.turnYaw,token)||token!==actionVersion))return {ok:false};
+    if(!lookDecision(target,{allowTurn:false}).ok)return {ok:false,detail:`未能朝向${label}`};
+    lookAt(target);run.applied=true;
+    const ok=await new Promise(resolve=>{run.resolve=resolve;});
+    if(!ok&&token===actionVersion&&currentLook===target){currentLook=run.previous;activityLookLease=run.previousLease;}
+    return {ok,detail:ok?(first.turnYaw===null?`朝${label}转了视线`:`转身朝向了${label}`):`视线没有稳定朝向${label}`};
+  }finally{if(explicitLook===run)explicitLook=null;}
+}
 function activityState(){
   const actual=avatar?.getState().activity;
   if(!actual)return null;
@@ -360,7 +392,7 @@ async function runActions(actions,{replace=true,announce=false,source='user',act
       if(gestureWait===completion)gestureWait=null;
       detail=action.type==='wave'?'挥了挥手':'轻轻点了点头';
     }else if(action.type==='look_at'){
-      lookAt(action.target);detail='看向了'+(places[action.target]?.label||'你');
+      ({ok,detail}=await performLook(action.target,token));
     }else if(action.type==='move_cup'){
       const cup=currentCup(),label=cupSpotLabel(action.target);
       if(!cup?.supported||!label){ok=false;detail='这里暂时不能挪杯子';}
@@ -394,8 +426,11 @@ function observedReading(){
 }
 function worldState(){
   const cup=currentCup();
+  const actual=avatar.getState().activity;
   const availableActivities=cup?.blocked?[]:avatar.supportedActivities.filter(activity=>activity!=='move_cup'||cup?.supported);
-  return {position:{x:+avatar.root.position.x.toFixed(2),z:+avatar.root.position.z.toFixed(2)},posture:state.mode,expression:state.expression,location:state.place,gaze:currentLook,activity:activityState(),reading:observedReading(),
+  const availableLookTargets=Object.keys(places).filter(target=>lookDecision(target,{activity:actual}).ok);
+  return {position:{x:+avatar.root.position.x.toFixed(2),z:+avatar.root.position.z.toFixed(2)},posture:state.mode,expression:state.expression,location:state.place,gaze:explicitLook?'turning':currentLook,
+    ...(explicitLook?{gazeRequested:explicitLook.target}:{}),availableLookTargets,activity:activityState(),reading:observedReading(),
     ...(cup?.supported?{cup:{...cup,supported:!cup.blocked}}:{}),availableTargets:Object.entries(places).map(([id,p])=>({id,name:p.label,x:p.x,z:p.z})),availableActivities,
     avatarModel:avatar.usingFallback?'pixiv-sample':avatar.tabletopSupported?'local-whale':'replacement-vrm',room:'客厅，有沙发、茶几、窗户、绿植、书柜和窗边小桌。可用活动以 availableActivities 为准；没有室外移动、做饭或任意拿取物品技能。'};
 }
@@ -708,6 +743,14 @@ function advanceFrame(dt,{realFrame=false}={}){
     const pageTurnAllowed=currentLook==='book'&&bookView.pageIndex<ROOM_BOOK.pages.length-1&&bookView.readPageIds.includes(bookView.pageId);
     avatar.update(dt,{time:elapsed,speed:animationSpeed,walkDirection,seated:state.mode==='seated',sitBlend:state.sitBlend,lookTarget,pageTurnAllowed,readAlongPage:readAlongPage&&currentLook==='book',groundHeightAt:room.groundHeightAt,attentionCueEnabled,renderVisible:realFrame});
     const actual=avatar.getState();
+    if(realFrame&&explicitLook?.resolve){
+      const run=explicitLook;
+      run.elapsed+=dt;
+      if(currentLook!==run.target||run.elapsed>=.45){
+        const resolve=run.resolve;run.resolve=null;
+        resolve(currentLook===run.target&&lookDecision(run.target,{allowTurn:false,activity:actual.activity}).ok);
+      }
+    }
     observeBook(actual,dt,realFrame);
     if(actual.activity||activityRun)presence();
     if(activityRun?.source==='chat')adoptChatReading();

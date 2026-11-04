@@ -235,6 +235,7 @@ export function buildPrompt(input) {
 - move_to 的目标只能是 sofa(沙发前)、window(窗边)、plant(植物旁)、center(房间中央)、user(用户前方)。
 - sit 仅支持沙发，target 为 sofa；本地执行器会自动走到沙发再坐下。stand 的 target 为 none。
 - wave/nod 的 target 为 none；look_at 只能指向 user/window/plant/sofa/center，不能为 none。
+- world.availableLookTargets 是当前姿势能朝向的目标；坐姿、桌边和拿杯时不能为看一眼强扭身体，先站起或移位后可以重新选择。转向完成前不能宣称已经看到了目标。
 - read/drink/stretch 的 target 都为 none。read 自动到桌边展开书并持续阅读，必须是 actions 最后一项；不是坐在沙发上读书，不先加 sit。drink 自动去杯子处拿杯喝一口放回（约 9 秒），stretch 是实际肩背伸展（约 6 秒）；它们完成后才执行下一项。${tabletopRestriction(input.world)}${cupActionGuidance(input.world)}
 - 用户要求坐下/站起/走动/做动作时，选择相应动作，聊天内容不要替代实际动作。
 - 下面的 world 是当前观测；feedback 是最近一次实际执行结果。动作下发后尚未完成，不要说“我已经坐好了”等完成宣称。可以说“好，我过来坐。”动作结果以反馈为准。
@@ -286,6 +287,7 @@ export function buildAutonomyPrompt(input) {
 身体行动协议：
 - actions 最多 4 项，按顺序执行。move_to 目标只有 sofa(沙发前)、window(窗边)、plant(植物旁)、center(中央)、user(用户前方)。
 - sit 仅限沙发，target=sofa，本地执行器自动走到沙发再坐；stand/wave/nod 的 target=none；look_at 只能指向 user/window/plant/sofa/center，不能为 none。
+- 只看一眼时从 world.availableLookTargets 选择目标；坐姿、桌边和拿杯时不强扭身体。若安排了站起或移位，可按新位置选择随后的视线方向。
 - read/drink/stretch 的 target=none：read 自动到桌边展开书并持续阅读，放 actions 最后一项，不能假装在沙发持书；drink 自动拿杯喝一口再放回（约 9 秒）；stretch 是实际肩背伸展（约 6 秒）。动作完成与否以 feedback 为准。没有开门、外出或其他任意拿取物体的技能。${tabletopRestriction(input.world)}${cupActionGuidance(input.world, true)}
 - 没有摄像头或环境图像，不声称“看见你在笑”“窗外正在下雨”等未被观测支持的内容。
 - 根据动作反馈避免再次尝试刚失败的同一目标；未执行的新动作不得宣称已经完成。
