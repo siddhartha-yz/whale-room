@@ -36,6 +36,25 @@ test('interrupting a drink preserves the current pose and returns directly witho
   }
 });
 
+test('a cup transfer anticipates its landing and returns its gaze with a cancelled hold', () => {
+  const source = [-.035, .5525, .34], destination = [-.235, .5525, .34];
+  const create = () => createActivityState('move_cup', { anchors: {
+    cup: source, cupPickup: [-.035, .54, .16], cupDestination: [-.235, .54, .16],
+  } });
+  const near = (actual, expected) => assert.ok(Math.hypot(...actual.map((value, i) => value - expected[i])) < 1e-6);
+  near(sampleActivity(advance(create(), 2.2)).lookAt, source);
+  const beforeSlide = sampleActivity(advance(create(), 2.95));
+  assert.equal(beforeSlide.phase, 'lifting-cup');
+  near(beforeSlide.lookAt, destination);
+  const returning = cancelActivityState(advance(create(), 3.6), { holdingProp: true });
+  near(sampleActivity(returning).lookAt, destination);
+  const returned = sampleActivity(advance(returning, .5));
+  near(returned.lookAt, source);
+  assert.equal(returned.shouldHoldCup, true);
+  const alreadyPlaced = cancelActivityState(advance(create(), 6.6), { holdingProp: false });
+  near(sampleActivity(alreadyPlaced).lookAt, destination);
+});
+
 async function avatarFixture() {
   const original = GLTFLoader.prototype.loadAsync;
   GLTFLoader.prototype.loadAsync = async () => loadLocalVrmFixture();

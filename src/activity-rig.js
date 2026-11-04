@@ -135,7 +135,10 @@ function moveCupFrame(state) {
   // The wider transfer reach uses a looser grip than the existing sip pose.
   frame.rightCurl = interval(t, 1.45, 1.9) * (1 - interval(t, 6.1, 6.6)) * .32;
   frame.shouldHoldCup = t >= 1.8 && t < 6.4;
-  frame.lookAt = a.cup;frame.pitchLimit = .10;
+  // Attend to the landing place before the sideways carry, then hold it.
+  // Only the gaze target changes; the pickup/destination wrist anchors do not.
+  const landing = a.cup.map((value, i) => value + a.cupDestination[i] - a.cupPickup[i]);
+  frame.lookAt = vector(a.cup, landing, interval(t, 2.3, 2.9));frame.pitchLimit = .10;
   return frame;
 }
 
@@ -152,7 +155,7 @@ function cancelMoveCupFrame(state, frame) {
   frame.rightTilt = from.rightTilt * (1 - interval(t, 0, .45));
   frame.rightCurl = from.rightCurl * (1 - interval(t, 1.9, 2.25));
   frame.shouldHoldCup = t < 2.05;
-  frame.lookAt = a.cup;frame.done = t >= 2.8;
+  frame.lookAt = vector(from.lookAt ?? a.cup, a.cup, interval(t, 0, .45));frame.done = t >= 2.8;
   return frame;
 }
 
