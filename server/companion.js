@@ -384,14 +384,15 @@ export async function runCompanion(input, { signal, timeoutMs = 120000, spawnPro
         diagnostics = String(detail).slice(0, 4000);
       }
     };
-    child.stdout.on('data', (chunk) => {
-      pending += chunk.toString();
+    // A pipe chunk can end mid-character. Decode the stream before splitting JSON lines.
+    child.stdout.setEncoding('utf8').on('data', (chunk) => {
+      pending += chunk;
       if (pending.length > 1_000_000) { failed = new CompanionError('模型输出超出限制。', 'OUTPUT_TOO_LARGE'); stop(); return; }
       const lines = pending.split('\n');
       pending = lines.pop() || '';
       for (const line of lines) handleLine(line);
     });
-    child.stderr.on('data', (chunk) => { diagnostics = (diagnostics + chunk.toString()).slice(-8000); });
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { diagnostics = (diagnostics + chunk).slice(-8000); });
     child.on('error', () => finish(new CompanionError('无法启动 Codex，请检查本机安装和登录状态。', 'CODEX_UNAVAILABLE', 503)));
     child.stdin.on('error', () => {});
     child.on('close', (code) => {

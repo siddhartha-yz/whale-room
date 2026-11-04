@@ -35,6 +35,28 @@ test('subscription invocation fixes Astra, read-only sandbox and disables execut
   assert.ok(!args.includes('--dangerously-bypass-approvals-and-sandbox'));
 });
 
+test('CLI bridge preserves UTF-8 reply characters split across stdout chunks', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  const reply = '嗯，我去窗边待一会儿。🐋';
+  const line = Buffer.from(JSON.stringify({ type: 'item.completed', item: {
+    type: 'agent_message', text: JSON.stringify({ ...sample, reply }),
+  } }) + '\n');
+  const finished = runCompanion(validateRequest({ message: '去窗边' }), { spawnProcess: () => {
+    queueMicrotask(() => {
+      // Pipes can split either a Chinese character or a four-byte emoji.
+      for (const byte of line) child.stdout.write(Buffer.of(byte));
+      child.stdout.end();
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  } });
+  assert.equal((await finished).reply, reply);
+});
+
 test('HTTP bridge rejects foreign origins and never invokes model for invalid input', async () => {
   let calls = 0;
   const runnerResult = { ...sample, model: 'gpt-6-astra', provider: 'codex-subscription', elapsedMs: 10192, usage: { input_tokens: 100, output_tokens: 40 } };
