@@ -63,6 +63,40 @@ test('tail ground is off by default and does not alter native spring settings', 
   } finally { avatar.dispose(); }
 });
 
+test('the real-geometry fixture accepts GLTFLoader-sanitized tail names without changing its calibration', { skip }, async () => {
+  // This is explicitly a renamed geometry fixture. The separate actual
+  // GLTFLoader probe reproduced WeiBa.001 -> WeiBa001 in the browser loader.
+  const { avatar, scene } = await fixture({ tailGround: true }, vrm => {
+    vrm.scene.traverse(node => { node.name = THREE.PropertyBinding.sanitizeNodeName(node.name); });
+  });
+  const joints = [...avatar.vrm.springBoneManager.joints];
+  try {
+    assert.equal(avatar.vrm.scene.getObjectByName('WeiBa.001'), undefined);
+    assert.ok(avatar.vrm.scene.getObjectByName('WeiBa001'));
+    assert.equal(avatar.getState().tailGround.enabled, true);
+    assert.equal(avatar.getState().tailGround.joints, 10);
+    assert.ok(scene.getObjectByName('CompanionTailGround'));
+    for (const joint of joints) { assert.equal(joint.settings.hitRadius, .04); assert.equal(joint.colliderGroups.length, 1); }
+  } finally { avatar.dispose(); }
+  for (const joint of joints) { assert.equal(joint.settings.hitRadius, 0); assert.equal(joint.colliderGroups.length, 0); }
+});
+
+test('ambiguous raw/sanitized aliases or duplicate loaded names cannot enable tail collision', { skip }, async () => {
+  for (const duplicateName of ['WeiBa.001', 'WeiBa001']) {
+    const { avatar, scene } = await fixture({ tailGround: true }, vrm => {
+      vrm.scene.traverse(node => { node.name = THREE.PropertyBinding.sanitizeNodeName(node.name); });
+      const decoy = new THREE.Object3D(); decoy.name = duplicateName; vrm.scene.add(decoy);
+    });
+    try {
+      assert.equal(avatar.getState().tailGround.enabled, false);
+      assert.equal(scene.getObjectByName('CompanionTailGround'), undefined);
+      for (const joint of avatar.vrm.springBoneManager.joints) {
+        assert.equal(joint.settings.hitRadius, 0); assert.equal(joint.colliderGroups.length, 0);
+      }
+    } finally { avatar.dispose(); }
+  }
+});
+
 test('replacement, changed chain, changed tail mesh and existing collision setup stay untouched', { skip }, async () => {
   const edits = [
     vrm => { vrm.meta.name = 'Replacement'; },

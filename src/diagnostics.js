@@ -246,7 +246,7 @@ export function installDiagnostics({ avatar, renderer, scene, camera, getWorldSt
       activity: face.activity, activityResult: face.activityResult,
       ...(readingGaze?.active ? { readingGaze: { scanning: readingGaze.scanning, line: readingGaze.line,
         fixation: round(readingGaze.fixation), targetLocal: readingGaze.targetLocal?.map(round) } } : {}),
-      ...(face.tailGround?.enabled ? { tailGround: face.tailGround } : {}),
+      ...(face.tailGround?.enabled || params.get('tailGround') === '1' ? { tailGround: face.tailGround } : {}),
       autonomy: compactAutonomy,
     };
     const eventKey = JSON.stringify([sample.renderPresence?.active, frameProbe, autonomy?.status, autonomy?.activity, autonomy?.requestCount, current?.id, current?.phase, autonomy?.lastIntentEvent?.sequence, reading?.status, reading?.pageIndex, reading?.readPageIds, feedback.map(item=>item.id)]);

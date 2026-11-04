@@ -20,10 +20,19 @@ function calibratedJoints(vrm) {
   if (['x', 'y', 'z'].some(axis => Math.abs(scale[axis] - 1.39055359) > .001)) return null;
   const joints = [...manager.joints].filter(j => j.bone.name.startsWith('WeiBa'));
   if (joints.length !== 10) return null;
+  // GLTFLoader removes punctuation from node names. Accept only the raw name
+  // or that exact official mapping; duplicate/competing matches remain unsafe.
+  const nodesByName = new Map();
+  vrm.scene.traverse(node => nodesByName.set(node.name, nodesByName.has(node.name) ? null : node));
+  const findNode = name => {
+    const matches = [...new Set([name, THREE.PropertyBinding.sanitizeNodeName(name)])]
+      .filter(candidate => nodesByName.has(candidate)).map(candidate => nodesByName.get(candidate));
+    return matches.length === 1 ? matches[0] : null;
+  };
   for (const chain of CHAINS) {
-    const center = vrm.scene.getObjectByName(chain.center);
+    const center = findNode(chain.center);
     for (let i = 0; i < chain.names.length - 1; i++) {
-      const bone = vrm.scene.getObjectByName(chain.names[i]), child = vrm.scene.getObjectByName(chain.names[i + 1]);
+      const bone = findNode(chain.names[i]), child = findNode(chain.names[i + 1]);
       const joint = joints.find(j => j.bone === bone);
       if (!bone || !child || !center || !joint || joint.child !== child || child.parent !== bone
         || joint.center !== center || (i === 0 && bone.parent !== center)
