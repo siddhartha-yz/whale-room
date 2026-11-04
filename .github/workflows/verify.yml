@@ -1,0 +1,85 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COMPANION_OFFLINE: '1'
+      COMPANION_CODEX_BIN: /nonexistent-ci-codex
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify the public offline room
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { once } from 'node:events';
+          import { existsSync, readFileSync } from 'node:fs';
+          import { startServer } from './server/index.js';
+
+          assert.equal(process.env.COMPANION_OFFLINE, '1');
+          for (const directory of ['public', 'dist']) {
+            assert.equal(existsSync(`${directory}/assets/deepseek-chibi.vrm`), false,
+              'The private whale model must not be in the public checkout or build.');
+          }
+          const server = await startServer({ port: 0, dev: false });
+          try {
+            if (!server.listening) await once(server, 'listening');
+            const origin = `http://127.0.0.1:${server.address().port}`;
+            const request = (path, options = {}) => fetch(`${origin}${path}`, {
+              ...options, signal: AbortSignal.timeout(5000),
+            });
+            assert.equal((await request('/')).status, 200);
+            const statusResponse = await request('/api/status');
+            assert.equal(statusResponse.status, 200);
+            const status = await statusResponse.json();
+            assert.equal(status.offline, true);
+            assert.equal(status.available, false);
+
+            const avatar = await request('/assets/avatar.vrm');
+            assert.equal(avatar.status, 200);
+            const bytes = Buffer.from(await avatar.arrayBuffer());
+            assert.deepEqual(bytes, readFileSync('public/assets/avatar.vrm'));
+            assert.equal(createHash('sha256').update(bytes).digest('hex'),
+              '12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2');
+
+            const chat = await request('/api/chat', {
+              method: 'POST', headers: { 'content-type': 'application/json', origin },
+              body: JSON.stringify({ message: 'offline smoke test', history: [] }),
+            });
+            assert.equal(chat.status, 503);
+            assert.equal((await chat.json()).code, 'OFFLINE_MODE');
+            console.log('Public avatar and offline HTTP checks passed.');
+          } finally {
+            server.closeAllConnections();
+            await new Promise(resolve => server.close(resolve));
+          }
+          NODE
